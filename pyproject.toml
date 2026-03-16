@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "householder-rope"
+version = "0.1.0"
+description = "Householder reflector basis transport for 1D and ND RoPE."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+jax = [
+  "jax>=0.4.38",
+]
+flax = [
+  "flax==0.10.4",
+  "optax>=0.2.1",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-p no:cacheprovider"
+testpaths = ["tests"]
+

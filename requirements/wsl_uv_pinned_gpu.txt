@@ -1,0 +1,14 @@
+# Base pinned GPU stack for WSL2 Ubuntu using uv and Python 3.11.
+# Install with:
+#   uv venv /home/$USER/.uv-envs/householder-pinned-gpu-py311-cu12 --python 3.11
+#   uv pip install --python /home/$USER/.uv-envs/householder-pinned-gpu-py311-cu12/bin/python -r requirements/wsl_uv_pinned_gpu.txt
+# Then install the PyTorch wheel from the CUDA 12.8 index:
+#   uv pip install --python /home/$USER/.uv-envs/householder-pinned-gpu-py311-cu12/bin/python torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+# PyTorch downgrades CuDNN below JAX's runtime floor, so restore the JAX-compatible CuDNN pin after the torch install:
+#   uv pip install --python /home/$USER/.uv-envs/householder-pinned-gpu-py311-cu12/bin/python nvidia-cudnn-cu12==9.20.0.48
+# Finally register the repo editable:
+#   uv pip install --python /home/$USER/.uv-envs/householder-pinned-gpu-py311-cu12/bin/python --no-deps -e /mnt/f/_codex/HOUSEHOLDER
+jax[cuda12]==0.9.1
+flax==0.12.5
+optax==0.2.6
+pytest==9.0.2

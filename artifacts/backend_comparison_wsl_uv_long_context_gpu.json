@@ -1,0 +1,220 @@
+{
+  "metadata": {
+    "scenario_set": "long_context_gpu",
+    "benchmark_mode": "gpu",
+    "repeats": 8,
+    "warmup": 3,
+    "environment": {
+      "python_version": "3.11.13",
+      "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.35",
+      "numpy_version": "2.4.3",
+      "torch_version": "2.7.0+cu128",
+      "jax_version": "0.9.1",
+      "jax_backend": "gpu",
+      "jax_devices": [
+        "cuda:0"
+      ],
+      "torch_cuda_available": true,
+      "flax_available": true,
+      "torch_cuda_device_name": "NVIDIA GeForce RTX 2080"
+    }
+  },
+  "results": [
+    {
+      "scenario": {
+        "name": "per_head_1d_long_context",
+        "mode": "per_head",
+        "group_size": 2,
+        "batch": 4,
+        "num_heads": 8,
+        "tokens": 1024,
+        "head_dim": 64,
+        "num_reflectors": 8,
+        "rope_ndim": 1,
+        "seed": 505
+      },
+      "environment": {
+        "python_version": "3.11.13",
+        "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.35",
+        "numpy_version": "2.4.3",
+        "torch_version": "2.7.0+cu128",
+        "jax_version": "0.9.1",
+        "jax_backend": "gpu",
+        "jax_devices": [
+          "cuda:0"
+        ],
+        "torch_cuda_available": true,
+        "flax_available": true,
+        "torch_cuda_device_name": "NVIDIA GeForce RTX 2080"
+      },
+      "numerical_agreement": {
+        "torch_vs_jax": {
+          "q_max_abs_diff": 1.5497207641601562e-06,
+          "k_max_abs_diff": 1.430511474609375e-06,
+          "q_rms_diff": 1.547046792893525e-07,
+          "k_rms_diff": 1.5506432760048483e-07,
+          "logit_max_abs_diff": 2.288818359375e-05,
+          "logit_rms_diff": 2.2302083380054682e-06
+        },
+        "jax_vs_flax": {
+          "q_max_abs_diff": 0.0,
+          "k_max_abs_diff": 0.0,
+          "q_rms_diff": 0.0,
+          "k_rms_diff": 0.0,
+          "logit_max_abs_diff": 0.0,
+          "logit_rms_diff": 0.0
+        }
+      },
+      "diagnostics": {
+        "torch": {
+          "orthogonality_defect": {
+            "max": 6.865499244668172e-07,
+            "mean": 5.786773726867978e-07
+          },
+          "relativity_defect": {
+            "max": 1.2192518026866555e-05,
+            "mean": 3.809915957867787e-06
+          },
+          "reversibility_defect": {
+            "max": 2.466755796280998e-07,
+            "mean": 2.0828599641364253e-07
+          },
+          "attention_logit_path_error": {
+            "max": 1.132688737574128e-06,
+            "mean": 9.66461566314926e-07
+          }
+        },
+        "jax": {
+          "orthogonality_defect": {
+            "max": 4.203094192689605e-07,
+            "mean": 3.859016430851625e-07
+          },
+          "relativity_defect": {
+            "max": 1.2177518328826409e-05,
+            "mean": 3.7680031255149515e-06
+          },
+          "reversibility_defect": {
+            "max": 2.4783554408713826e-07,
+            "mean": 2.0837390479755413e-07
+          },
+          "attention_logit_path_error": {
+            "max": 6.949688895474537e-07,
+            "mean": 6.660166604888218e-07
+          }
+        }
+      },
+      "runtime_ms": {
+        "jax_gpu_jit": {
+          "mean_ms": 1.6174517513718456,
+          "std_ms": 0.2539313176267095
+        },
+        "flax_gpu_jit": {
+          "mean_ms": 1.6576881243963726,
+          "std_ms": 0.39685796831246706
+        },
+        "torch_cuda": {
+          "mean_ms": 6.38055827585049,
+          "std_ms": 1.452421617254141
+        }
+      }
+    },
+    {
+      "scenario": {
+        "name": "group_shared_2d_long_context",
+        "mode": "group_shared",
+        "group_size": 2,
+        "batch": 2,
+        "num_heads": 8,
+        "tokens": 768,
+        "head_dim": 128,
+        "num_reflectors": 16,
+        "rope_ndim": 2,
+        "seed": 606
+      },
+      "environment": {
+        "python_version": "3.11.13",
+        "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.35",
+        "numpy_version": "2.4.3",
+        "torch_version": "2.7.0+cu128",
+        "jax_version": "0.9.1",
+        "jax_backend": "gpu",
+        "jax_devices": [
+          "cuda:0"
+        ],
+        "torch_cuda_available": true,
+        "flax_available": true,
+        "torch_cuda_device_name": "NVIDIA GeForce RTX 2080"
+      },
+      "numerical_agreement": {
+        "torch_vs_jax": {
+          "q_max_abs_diff": 1.430511474609375e-06,
+          "k_max_abs_diff": 1.6093254089355469e-06,
+          "q_rms_diff": 1.6870947661118407e-07,
+          "k_rms_diff": 1.6896665044896508e-07,
+          "logit_max_abs_diff": 3.0517578125e-05,
+          "logit_rms_diff": 3.7634611089742975e-06
+        },
+        "jax_vs_flax": {
+          "q_max_abs_diff": 0.0,
+          "k_max_abs_diff": 0.0,
+          "q_rms_diff": 0.0,
+          "k_rms_diff": 0.0,
+          "logit_max_abs_diff": 0.0,
+          "logit_rms_diff": 0.0
+        }
+      },
+      "diagnostics": {
+        "torch": {
+          "orthogonality_defect": {
+            "max": 1.1773903452194645e-06,
+            "mean": 1.1415096423661453e-06
+          },
+          "relativity_defect": {
+            "max": 1.2683710217498181e-06,
+            "mean": 1.18072433952582e-06
+          },
+          "reversibility_defect": {
+            "max": 3.1745520441182885e-07,
+            "mean": 2.732579836639256e-07
+          },
+          "attention_logit_path_error": {
+            "max": 2.1785284437979875e-06,
+            "mean": 2.0782347595806295e-06
+          }
+        },
+        "jax": {
+          "orthogonality_defect": {
+            "max": 6.924042850187107e-07,
+            "mean": 6.712653544127534e-07
+          },
+          "relativity_defect": {
+            "max": 8.353796374649392e-07,
+            "mean": 7.587867116853886e-07
+          },
+          "reversibility_defect": {
+            "max": 3.1664708899370453e-07,
+            "mean": 2.737748445724719e-07
+          },
+          "attention_logit_path_error": {
+            "max": 1.267542756977491e-06,
+            "mean": 1.237792162100959e-06
+          }
+        }
+      },
+      "runtime_ms": {
+        "jax_gpu_jit": {
+          "mean_ms": 1.893918502901215,
+          "std_ms": 0.8050101223268243
+        },
+        "flax_gpu_jit": {
+          "mean_ms": 2.8048291205777787,
+          "std_ms": 0.3837026227434201
+        },
+        "torch_cuda": {
+          "mean_ms": 8.943563494540285,
+          "std_ms": 1.5082236319307332
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,164 @@
+[
+  {
+    "scenario": {
+      "name": "per_head_1d_small",
+      "mode": "per_head",
+      "group_size": 2,
+      "batch": 2,
+      "num_heads": 4,
+      "tokens": 32,
+      "head_dim": 32,
+      "num_reflectors": 4,
+      "rope_ndim": 1,
+      "seed": 101
+    },
+    "environment": {
+      "jax_backend": "gpu",
+      "flax_available": false,
+      "flax_import_error": "'Config' object has no attribute 'define_bool_state'"
+    },
+    "numerical_agreement": {
+      "torch_vs_jax": {
+        "q_max_abs_diff": 8.344650268554688e-07,
+        "k_max_abs_diff": 1.0728836059570312e-06,
+        "q_rms_diff": 1.368369879628517e-07,
+        "k_rms_diff": 1.3621529149077105e-07,
+        "logit_max_abs_diff": 1.049041748046875e-05,
+        "logit_rms_diff": 1.3672998875335907e-06
+      }
+    },
+    "diagnostics": {
+      "torch": {
+        "orthogonality_defect": {
+          "max": 3.625684428243403e-07,
+          "mean": 3.218875406219013e-07
+        },
+        "relativity_defect": {
+          "max": 5.571628300875411e-07,
+          "mean": 3.789727502857581e-07
+        },
+        "reversibility_defect": {
+          "max": 1.733793040721425e-07,
+          "mean": 1.4058185709474992e-07
+        },
+        "attention_logit_path_error": {
+          "max": 6.374698166691595e-07,
+          "mean": 5.759814172241527e-07
+        }
+      },
+      "jax": {
+        "orthogonality_defect": {
+          "max": 3.6347123000268766e-07,
+          "mean": 3.2554578410781687e-07
+        },
+        "relativity_defect": {
+          "max": 5.761237957813137e-07,
+          "mean": 3.9914857552503236e-07
+        },
+        "reversibility_defect": {
+          "max": 1.6760949961280858e-07,
+          "mean": 1.4149281923891976e-07
+        },
+        "attention_logit_path_error": {
+          "max": 6.492789452750003e-07,
+          "mean": 5.771831865786226e-07
+        }
+      }
+    },
+    "runtime_ms": {
+      "torch_cpu": {
+        "mean_ms": 0.6577056017704308,
+        "std_ms": 0.03718615061057991
+      },
+      "jax_gpu_jit": {
+        "mean_ms": 0.17188452766276896,
+        "std_ms": 0.043955488522940574
+      },
+      "torch_cuda": {
+        "mean_ms": 2.0640047325287014,
+        "std_ms": 0.16299280719787343
+      }
+    }
+  },
+  {
+    "scenario": {
+      "name": "group_shared_2d_medium",
+      "mode": "group_shared",
+      "group_size": 2,
+      "batch": 2,
+      "num_heads": 4,
+      "tokens": 64,
+      "head_dim": 64,
+      "num_reflectors": 8,
+      "rope_ndim": 2,
+      "seed": 202
+    },
+    "environment": {
+      "jax_backend": "gpu",
+      "flax_available": false,
+      "flax_import_error": "'Config' object has no attribute 'define_bool_state'"
+    },
+    "numerical_agreement": {
+      "torch_vs_jax": {
+        "q_max_abs_diff": 9.5367431640625e-07,
+        "k_max_abs_diff": 7.152557373046875e-07,
+        "q_rms_diff": 1.4801680947584828e-07,
+        "k_rms_diff": 1.4645573287452862e-07,
+        "logit_max_abs_diff": 1.71661376953125e-05,
+        "logit_rms_diff": 2.233489794889465e-06
+      }
+    },
+    "diagnostics": {
+      "torch": {
+        "orthogonality_defect": {
+          "max": 6.350210242089815e-07,
+          "mean": 5.87958538744715e-07
+        },
+        "relativity_defect": {
+          "max": 6.689194400023908e-07,
+          "mean": 6.124696172306404e-07
+        },
+        "reversibility_defect": {
+          "max": 2.213982216405681e-07,
+          "mean": 1.801305925906475e-07
+        },
+        "attention_logit_path_error": {
+          "max": 1.1925425542550897e-06,
+          "mean": 1.1086923205089543e-06
+        }
+      },
+      "jax": {
+        "orthogonality_defect": {
+          "max": 6.478767886619607e-07,
+          "mean": 6.192723276399192e-07
+        },
+        "relativity_defect": {
+          "max": 7.035996532067657e-07,
+          "mean": 6.581843763342476e-07
+        },
+        "reversibility_defect": {
+          "max": 2.2389926357391232e-07,
+          "mean": 1.7669731278147083e-07
+        },
+        "attention_logit_path_error": {
+          "max": 1.200611563945131e-06,
+          "mean": 1.1611501804509317e-06
+        }
+      }
+    },
+    "runtime_ms": {
+      "torch_cpu": {
+        "mean_ms": 1.692210469627753,
+        "std_ms": 0.31385969450237017
+      },
+      "jax_gpu_jit": {
+        "mean_ms": 0.7255102003303667,
+        "std_ms": 0.9389845708235465
+      },
+      "torch_cuda": {
+        "mean_ms": 2.7393845395029834,
+        "std_ms": 0.37752824214405944
+      }
+    }
+  }
+]
