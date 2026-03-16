@@ -135,7 +135,7 @@ demo_householder_rope_jax.ipynb
 colab_householder_rope_scaling_harness.ipynb
 ```
 
-For a realistic A100 or TPU Colab run, open `colab_householder_rope_scaling_harness.ipynb`. Its first code cell will `git clone` the repo if needed and install the runtime with `uv`, then the notebook offers three A100-ready profiles: `fast_sanity`, `serious_comparison`, and `long_context_stress`. The default runs `scripts/run_real_data_scale_harness.py` on `wikitext-103-raw-v1`, compares `num_reflectors in {0, 8, 16}`, emits ongoing optimization diagnostics during training, and writes JSON, JSONL, CSV, and PNG artifacts into `artifacts/`, including dedicated training-dynamics, component-diagnostics, and RoPE-health plots.
+For a realistic A100 or TPU Colab run, open `colab_householder_rope_scaling_harness.ipynb`. Its first code cell will `git clone` the repo if needed and install the runtime with `uv`, then the notebook offers three A100-ready profiles: `fast_sanity`, `serious_comparison`, and `long_context_stress`. The default `serious_comparison` profile is now sized for a 40GB A100 with a 6-layer, 1024-width, 1024-token configuration, and the notebook runs the harness in unbuffered mode so the live training logs stream directly into the Colab cell output. It still compares `num_reflectors in {0, 8, 16}` and writes JSON, JSONL, CSV, and PNG artifacts into `artifacts/`, including dedicated training-dynamics, component-diagnostics, and RoPE-health plots.
 
 Minimal PyTorch usage:
 

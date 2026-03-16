@@ -19,6 +19,8 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "## Validation plan" in intro
     assert "## Known failure modes" in intro
     assert "## Next steps" in intro
+    assert "40GB A100" in intro
+    assert "logs stream live" in intro or "stream live" in intro
 
     joined_sources = "\n".join(cell["source"] for cell in cells)
     assert 'run_command("git", "clone"' in joined_sources
@@ -31,6 +33,11 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "serious_comparison" in joined_sources
     assert "long_context_stress" in joined_sources
     assert 'ACTIVE_PROFILE = "serious_comparison"' in joined_sources
+    assert '"seq_len": 1024' in joined_sources
+    assert '"batch_size": 6' in joined_sources
+    assert '"num_layers": 6' in joined_sources
+    assert '"embed_dim": 1024' in joined_sources
+    assert '"num_heads": 16' in joined_sources
     assert "log_every" in joined_sources
     assert "diagnostics_every" in joined_sources
     assert "diagnostic_token_limit" in joined_sources
@@ -38,3 +45,8 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "component_diagnostics.png" in joined_sources
     assert "rope_diagnostics.png" in joined_sources
     assert "history_jsonl_path" in joined_sources
+    assert 'PYTHONUNBUFFERED="1"' in joined_sources
+    assert '"-u"' in joined_sources
+    assert '"--log-level"' in joined_sources
+    assert '"INFO"' in joined_sources
+    assert "Live harness logs will stream below." in joined_sources
