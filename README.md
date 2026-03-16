@@ -71,6 +71,12 @@ python scripts/run_attention_block_benchmark.py --scenario-set long_context_gpu 
 python scripts/plot_attention_block_benchmark.py --inputs artifacts/attention_block_benchmark_wsl_pinned_large.json artifacts/attention_block_benchmark_wsl_pinned_long_context.json --output-prefix artifacts/attention_block_sequence_sweep
 ```
 
+For a realistic-data single-device run outside Colab, use the reusable harness:
+
+```bash
+python scripts/run_real_data_scale_harness.py --train-steps 20 --reflector-sweep 0 8 --output-stem realistic_data_smoke
+```
+
 For a WSL GPU comparison run with `uv`, where Ubuntu already has working CUDA-enabled JAX and PyTorch in the system Python, use a shared-package `uv` environment and only overlay the minimal safe packages:
 
 ```bash
@@ -126,7 +132,10 @@ Open the notebooks:
 ```text
 demo_householder_rope.ipynb
 demo_householder_rope_jax.ipynb
+colab_householder_rope_scaling_harness.ipynb
 ```
+
+For a realistic A100 or TPU Colab run, open `colab_householder_rope_scaling_harness.ipynb`. Its first code cell will `git clone` the repo if needed and install the runtime with `uv`, then the notebook runs `scripts/run_real_data_scale_harness.py` on `wikitext-103-raw-v1`, compares `num_reflectors in {0, 8, 16}`, and writes JSON, CSV, and PNG artifacts into `artifacts/`.
 
 Minimal PyTorch usage:
 
