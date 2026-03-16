@@ -22,7 +22,8 @@ def test_colab_scaling_harness_notebook_structure() -> None:
 
     joined_sources = "\n".join(cell["source"] for cell in cells)
     assert 'run_command("git", "clone"' in joined_sources
-    assert "uv pip install --system" in joined_sources
+    assert "uv" in joined_sources
+    assert "--system" in joined_sources
     assert "wikitext-103-raw-v1" in joined_sources
     assert "run_real_data_scale_harness.py" in joined_sources
     assert "A100_PRESETS" in joined_sources
@@ -30,3 +31,10 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "serious_comparison" in joined_sources
     assert "long_context_stress" in joined_sources
     assert 'ACTIVE_PROFILE = "serious_comparison"' in joined_sources
+    assert "log_every" in joined_sources
+    assert "diagnostics_every" in joined_sources
+    assert "diagnostic_token_limit" in joined_sources
+    assert "training_dynamics.png" in joined_sources
+    assert "component_diagnostics.png" in joined_sources
+    assert "rope_diagnostics.png" in joined_sources
+    assert "history_jsonl_path" in joined_sources

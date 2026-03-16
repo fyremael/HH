@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "run_real_data_scale_harness.py"
@@ -47,6 +48,9 @@ def test_config_to_dict_serializes_output_dir() -> None:
         train_steps=1,
         eval_every=1,
         eval_batches=1,
+        log_every=1,
+        diagnostics_every=1,
+        diagnostic_token_limit=8,
         num_layers=1,
         embed_dim=32,
         num_heads=4,
@@ -64,3 +68,45 @@ def test_config_to_dict_serializes_output_dir() -> None:
     payload = config.to_dict()
     assert payload["output_dir"] == str(output_dir)
     assert payload["reflector_sweep"] == (0, 8)
+    assert payload["diagnostics_every"] == 1
+
+
+def test_reduce_rope_diagnostics_summarizes_nested_metrics() -> None:
+    reduced = MODULE.reduce_rope_diagnostics(
+        {
+            "orthogonality_defect": torch.tensor([1.0e-6, 2.0e-6]),
+            "relativity_defect": torch.tensor([[3.0e-6, 5.0e-6]]),
+            "block_mixing_energy": torch.tensor(
+                [
+                    [1.0, 0.1, 0.2],
+                    [0.3, 1.1, 0.4],
+                    [0.5, 0.6, 1.2],
+                ]
+            ),
+            "reflector_utilization": {
+                "raw_norms": torch.tensor([[2.0, 4.0]]),
+                "pair_cosine_similarity": torch.tensor([0.9, 0.95]),
+                "identity_deviation": torch.tensor([0.01, 0.02]),
+            },
+        }
+    )
+    assert reduced["orthogonality_defect_mean"] == pytest.approx(1.5e-6)
+    assert reduced["relativity_defect_max"] == pytest.approx(5.0e-6)
+    assert reduced["block_mixing_offdiag_mean"] == pytest.approx((0.1 + 0.2 + 0.3 + 0.4 + 0.5 + 0.6) / 6.0)
+    assert reduced["raw_reflector_norm_mean"] == pytest.approx(3.0)
+    assert reduced["pair_cosine_similarity_mean"] == pytest.approx(0.925)
+
+
+def test_flatten_metrics_flattens_nested_diagnostics() -> None:
+    flat = MODULE.flatten_metrics(
+        {
+            "step": 3,
+            "diagnostics": {
+                "summary": {"probe_loss": 6.5},
+                "layers": {"block_0": {"rope_orthogonality_defect_mean": 1.0e-6}},
+            },
+        }
+    )
+    assert flat["step"] == 3
+    assert flat["diagnostics_summary_probe_loss"] == 6.5
+    assert flat["diagnostics_layers_block_0_rope_orthogonality_defect_mean"] == 1.0e-6

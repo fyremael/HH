@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
+import math
 import os
 import platform
 import random
@@ -27,6 +29,7 @@ if str(SRC) not in sys.path:
 
 from householder_rope.attention import HouseholderSelfAttention  # noqa: E402
 from householder_rope.core import BlockDiagonalRoPECore, HouseholderRoPE, HouseholderRoPEConfig  # noqa: E402
+from householder_rope.diagnostics import summarize_householder_rope_diagnostics  # noqa: E402
 
 
 LOGGER = logging.getLogger("real_data_scale_harness")
@@ -58,6 +61,9 @@ class RealDataHarnessConfig:
     train_steps: int
     eval_every: int
     eval_batches: int
+    log_every: int
+    diagnostics_every: int
+    diagnostic_token_limit: int
     num_layers: int
     embed_dim: int
     num_heads: int
@@ -123,6 +129,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-steps", type=int, default=60, help="Optimizer steps per variant.")
     parser.add_argument("--eval-every", type=int, default=10, help="Evaluation frequency in steps.")
     parser.add_argument("--eval-batches", type=int, default=8, help="Validation batches per eval.")
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=5,
+        help="Emit an INFO training summary every N optimizer steps.",
+    )
+    parser.add_argument(
+        "--diagnostics-every",
+        type=int,
+        default=10,
+        help="Run the deeper probe diagnostics every N optimizer steps.",
+    )
+    parser.add_argument(
+        "--diagnostic-token-limit",
+        type=int,
+        default=128,
+        help="Maximum sequence length used by the dense diagnostics probe.",
+    )
     parser.add_argument("--num-layers", type=int, default=2, help="Number of transformer blocks.")
     parser.add_argument("--embed-dim", type=int, default=512, help="Embedding width.")
     parser.add_argument("--num-heads", type=int, default=8, help="Attention heads.")
@@ -176,7 +200,46 @@ def parse_args() -> argparse.Namespace:
 
 
 def configure_logging(level: str) -> None:
-    logging.basicConfig(level=getattr(logging, level), format="%(asctime)s | %(levelname)s | %(message)s")
+    logging.basicConfig(
+        level=getattr(logging, level),
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        stream=sys.stdout,
+        force=True,
+    )
+    LOGGER.setLevel(getattr(logging, level))
+
+
+def should_log_record(config: RealDataHarnessConfig, record: dict[str, Any]) -> bool:
+    return (
+        record["step"] == 1
+        or record["step"] == config.train_steps
+        or record["step"] % config.log_every == 0
+        or "eval_loss" in record
+        or "diagnostics" in record
+    )
+
+
+def log_variant_start(config: RealDataHarnessConfig, variant: RopeVariant, *, backend: str) -> None:
+    LOGGER.info(
+        "Starting %s | backend=%s | reflectors=%d | steps=%d | batch=%d | seq_len=%d | log_every=%d | diagnostics_every=%d",
+        variant.label,
+        backend,
+        variant.num_reflectors,
+        config.train_steps,
+        config.batch_size,
+        config.seq_len,
+        config.log_every,
+        config.diagnostics_every,
+    )
+
+
+def log_variant_paths(variant: RopeVariant, *, history_jsonl_path: Path, history_csv_path: Path) -> None:
+    LOGGER.info(
+        "%s | history_jsonl=%s | history_csv=%s",
+        variant.label,
+        history_jsonl_path,
+        history_csv_path,
+    )
 
 
 def import_dataset_runtime():
@@ -272,6 +335,7 @@ def build_variants(reflector_sweep: tuple[int, ...], householder_init: str) -> l
             )
     return variants
 
+
 def build_lm_splits(config: RealDataHarnessConfig):
     load_dataset, AutoTokenizer = import_dataset_runtime()
     raw = load_dataset(config.dataset_name, config.dataset_config)
@@ -353,6 +417,215 @@ def batch_iterator(split, batch_size: int, *, shuffle: bool, seed: int) -> Itera
             }
         if not shuffle:
             break
+
+
+def exp_clamped(value: float, *, limit: float = 20.0) -> float:
+    return float(math.exp(min(value, limit)))
+
+
+def tensor_rms(value: torch.Tensor) -> float:
+    value = value.detach().float()
+    return float(torch.sqrt(torch.mean(value.square())).cpu())
+
+
+def tensor_std(value: torch.Tensor) -> float:
+    return float(value.detach().float().std(unbiased=False).cpu())
+
+
+def tensor_max_abs(value: torch.Tensor) -> float:
+    return float(value.detach().float().abs().max().cpu())
+
+
+def parameter_global_norm(parameters: Iterator[torch.Tensor]) -> float:
+    total = 0.0
+    for parameter in parameters:
+        value = parameter.detach().float()
+        total += float(torch.sum(value.square()).cpu())
+    return math.sqrt(total)
+
+
+def gradient_global_norm(parameters: Iterator[torch.Tensor]) -> float:
+    total = 0.0
+    for parameter in parameters:
+        if parameter.grad is None:
+            continue
+        grad = parameter.grad.detach().float()
+        total += float(torch.sum(grad.square()).cpu())
+    return math.sqrt(total)
+
+
+def reduce_numeric_metric(value: Any) -> dict[str, float]:
+    array = np.asarray(to_serializable(value), dtype=np.float64)
+    if array.size == 0:
+        return {}
+    flat = array.reshape(-1)
+    return {
+        "mean": float(np.mean(flat)),
+        "max": float(np.max(flat)),
+        "min": float(np.min(flat)),
+    }
+
+
+def block_mixing_offdiag_mean(value: Any) -> float | None:
+    array = np.asarray(to_serializable(value), dtype=np.float64)
+    if array.size == 0:
+        return None
+    if array.ndim == 2:
+        array = array[None, ...]
+    if array.ndim != 3 or array.shape[-1] != array.shape[-2]:
+        return None
+    mask = ~np.eye(array.shape[-1], dtype=bool)
+    offdiag = array[:, mask]
+    if offdiag.size == 0:
+        return 0.0
+    return float(np.mean(offdiag))
+
+
+def reduce_rope_diagnostics(summary: dict[str, Any]) -> dict[str, float]:
+    reduced: dict[str, float] = {}
+    for key in (
+        "orthogonality_defect",
+        "relativity_defect",
+        "reversibility_defect",
+        "commutator_defect",
+        "attention_logit_path_error",
+    ):
+        if key not in summary:
+            continue
+        stats = reduce_numeric_metric(summary[key])
+        if not stats:
+            continue
+        reduced[f"{key}_mean"] = stats["mean"]
+        reduced[f"{key}_max"] = stats["max"]
+
+    if "block_mixing_energy" in summary:
+        stats = reduce_numeric_metric(summary["block_mixing_energy"])
+        if stats:
+            reduced["block_mixing_energy_mean"] = stats["mean"]
+            reduced["block_mixing_energy_max"] = stats["max"]
+        offdiag_mean = block_mixing_offdiag_mean(summary["block_mixing_energy"])
+        if offdiag_mean is not None:
+            reduced["block_mixing_offdiag_mean"] = offdiag_mean
+
+    utilization = summary.get("reflector_utilization", {})
+    field_map = {
+        "raw_norms": "raw_reflector_norm",
+        "pair_cosine_similarity": "pair_cosine_similarity",
+        "identity_deviation": "identity_deviation",
+        "orthogonality_defect": "utilization_orthogonality_defect",
+        "gradient_norms": "reflector_gradient_norm",
+    }
+    for key, prefix in field_map.items():
+        if key not in utilization:
+            continue
+        stats = reduce_numeric_metric(utilization[key])
+        if not stats:
+            continue
+        reduced[f"{prefix}_mean"] = stats["mean"]
+        reduced[f"{prefix}_max"] = stats["max"]
+    return reduced
+
+
+def flatten_metrics(value: Any, *, prefix: str = "") -> dict[str, Any]:
+    flat: dict[str, Any] = {}
+    if isinstance(value, dict):
+        for key, item in value.items():
+            next_prefix = f"{prefix}_{key}" if prefix else str(key)
+            flat.update(flatten_metrics(item, prefix=next_prefix))
+        return flat
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            next_prefix = f"{prefix}_{index}" if prefix else str(index)
+            flat.update(flatten_metrics(item, prefix=next_prefix))
+        return flat
+    flat[prefix] = to_serializable(value)
+    return flat
+
+
+def append_jsonl(path: Path, record: dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(to_serializable(record)) + "\n")
+
+
+def write_history_csv(history: list[dict[str, Any]], path: Path) -> None:
+    rows = [flatten_metrics(record) for record in history]
+    fieldnames: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in row:
+            if key in seen:
+                continue
+            fieldnames.append(key)
+            seen.add(key)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def history_series(history: list[dict[str, Any]], key: str) -> tuple[list[int], list[float]]:
+    steps: list[int] = []
+    values: list[float] = []
+    for record in history:
+        if key not in record:
+            continue
+        steps.append(int(record["step"]))
+        values.append(float(record[key]))
+    return steps, values
+
+
+def mean_from_history(history: list[dict[str, Any]], key: str) -> float | None:
+    values = [float(record[key]) for record in history if key in record]
+    if not values:
+        return None
+    return float(statistics.mean(values))
+
+
+def last_from_history(history: list[dict[str, Any]], key: str) -> Any:
+    for record in reversed(history):
+        if key in record:
+            return record[key]
+    return None
+
+
+def latest_diagnostics(history: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for record in reversed(history):
+        if "diagnostics" in record:
+            return record["diagnostics"]
+    return None
+
+
+def summarize_variant_result(
+    *,
+    backend: str,
+    variant: RopeVariant,
+    parameter_count: int,
+    history: list[dict[str, Any]],
+    peak_memory_gb: float | None,
+    history_jsonl_path: Path,
+    history_csv_path: Path,
+) -> dict[str, Any]:
+    eval_history = [entry["eval_loss"] for entry in history if "eval_loss" in entry]
+    latest_probe = latest_diagnostics(history)
+    result = {
+        "backend": backend,
+        "variant": variant.label,
+        "num_reflectors": variant.num_reflectors,
+        "parameter_count": parameter_count,
+        "final_train_loss": history[-1]["train_loss"],
+        "final_train_perplexity": history[-1].get("train_perplexity"),
+        "final_eval_loss": eval_history[-1] if eval_history else None,
+        "mean_step_ms": float(statistics.mean(entry["step_ms"] for entry in history)),
+        "mean_tokens_per_second": float(statistics.mean(entry["tokens_per_second"] for entry in history)),
+        "mean_grad_global_norm": mean_from_history(history, "grad_global_norm"),
+        "mean_parameter_global_norm": mean_from_history(history, "parameter_global_norm"),
+        "peak_memory_gb": peak_memory_gb,
+        "latest_probe_summary": None if latest_probe is None else latest_probe.get("summary"),
+        "history_jsonl_path": str(history_jsonl_path),
+        "history_csv_path": str(history_csv_path),
+        "history": history,
+    }
+    return result
 
 
 class TorchFeedForward(nn.Module):
@@ -450,11 +723,18 @@ def evaluate_torch(
     eval_batches: int,
     seed: int,
     device: torch.device,
+    use_bf16: bool,
 ) -> float:
     iterator = batch_iterator(split, batch_size, shuffle=False, seed=seed)
     losses: list[float] = []
+    training_state = model.training
     model.eval()
-    with torch.no_grad():
+    amp_context = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if use_bf16 and device.type == "cuda"
+        else nullcontext()
+    )
+    with torch.no_grad(), amp_context:
         for batch_index, batch in enumerate(iterator):
             if batch_index >= eval_batches:
                 break
@@ -463,7 +743,162 @@ def evaluate_torch(
             logits = model(input_ids)
             loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1))
             losses.append(float(loss.detach().cpu()))
+    model.train(training_state)
     return float(np.mean(losses))
+
+
+def collect_torch_probe_metrics(
+    model: TorchHouseholderLM,
+    batch: dict[str, np.ndarray],
+    *,
+    device: torch.device,
+    use_bf16: bool,
+    diagnostic_token_limit: int,
+) -> dict[str, Any]:
+    probe_tokens = min(int(batch["input_ids"].shape[1]), diagnostic_token_limit)
+    input_ids = torch.from_numpy(batch["input_ids"][:, :probe_tokens]).to(device)
+    labels = torch.from_numpy(batch["labels"][:, :probe_tokens]).to(device)
+    captured: dict[str, torch.Tensor] = {}
+    handles: list[Any] = []
+
+    def capture_tensor(name: str):
+        def hook(_module, inputs, output):
+            tensor = output[0] if isinstance(output, tuple) else output
+            captured[name] = tensor.detach().float()
+        return hook
+
+    def capture_block(name: str):
+        def hook(_module, inputs, output):
+            captured[f"{name}.input"] = inputs[0].detach().float()
+            captured[f"{name}.output"] = output.detach().float()
+        return hook
+
+    handles.append(model.token_embed.register_forward_hook(capture_tensor("token_embed")))
+    handles.append(model.final_norm.register_forward_hook(capture_tensor("final_norm")))
+    handles.append(model.lm_head.register_forward_hook(capture_tensor("lm_head")))
+    for index, block in enumerate(model.blocks):
+        prefix = f"block_{index}"
+        handles.append(block.register_forward_hook(capture_block(prefix)))
+        handles.append(block.norm1.register_forward_hook(capture_tensor(f"{prefix}.norm1")))
+        handles.append(block.attn.register_forward_hook(capture_tensor(f"{prefix}.attn")))
+        handles.append(block.norm2.register_forward_hook(capture_tensor(f"{prefix}.norm2")))
+        handles.append(block.ff.register_forward_hook(capture_tensor(f"{prefix}.ff")))
+        handles.append(block.attn.q_proj.register_forward_hook(capture_tensor(f"{prefix}.q_proj")))
+        handles.append(block.attn.k_proj.register_forward_hook(capture_tensor(f"{prefix}.k_proj")))
+
+    amp_context = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if use_bf16 and device.type == "cuda"
+        else nullcontext()
+    )
+    training_state = model.training
+    model.eval()
+    with torch.no_grad(), amp_context:
+        logits = model(input_ids)
+    if training_state:
+        model.train()
+    for handle in handles:
+        handle.remove()
+
+    log_probs = logits.float().log_softmax(dim=-1)
+    probs = log_probs.exp()
+    entropy = -(probs * log_probs).sum(dim=-1).mean()
+    confidence = probs.max(dim=-1).values.mean()
+    top2 = torch.topk(probs, k=2, dim=-1).values
+    top2_margin = (top2[..., 0] - top2[..., 1]).mean()
+    probe_loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1))
+
+    layer_metrics: dict[str, dict[str, float]] = {}
+    rope_summaries: list[dict[str, float]] = []
+    pos = torch.arange(probe_tokens, device=device, dtype=torch.float32)
+    for index, block in enumerate(model.blocks):
+        prefix = f"block_{index}"
+        block_metrics: dict[str, float] = {
+            "block_input_rms": tensor_rms(captured[f"{prefix}.input"]),
+            "block_output_rms": tensor_rms(captured[f"{prefix}.output"]),
+            "block_delta_rms": tensor_rms(captured[f"{prefix}.output"] - captured[f"{prefix}.input"]),
+            "norm1_output_rms": tensor_rms(captured[f"{prefix}.norm1"]),
+            "attention_output_rms": tensor_rms(captured[f"{prefix}.attn"]),
+            "norm2_output_rms": tensor_rms(captured[f"{prefix}.norm2"]),
+            "feedforward_output_rms": tensor_rms(captured[f"{prefix}.ff"]),
+            "q_proj_rms": tensor_rms(captured[f"{prefix}.q_proj"]),
+            "k_proj_rms": tensor_rms(captured[f"{prefix}.k_proj"]),
+        }
+        q = block.attn._split_heads(captured[f"{prefix}.q_proj"].to(device))
+        k = block.attn._split_heads(captured[f"{prefix}.k_proj"].to(device))
+        rope_summary = summarize_householder_rope_diagnostics(
+            block.attn.rope,
+            pos_a=pos,
+            pos_b=pos + 1.0,
+            q=q,
+            k=k,
+        )
+        reduced_rope = {f"rope_{key}": value for key, value in reduce_rope_diagnostics(rope_summary).items()}
+        block_metrics.update(reduced_rope)
+        rope_summaries.append(reduced_rope)
+        layer_metrics[prefix] = block_metrics
+
+    def layer_mean(key: str) -> float | None:
+        values = [metrics[key] for metrics in layer_metrics.values() if key in metrics]
+        if not values:
+            return None
+        return float(statistics.mean(values))
+
+    summary: dict[str, float | int] = {
+        "probe_tokens": probe_tokens,
+        "probe_batch_size": int(input_ids.shape[0]),
+        "probe_loss": float(probe_loss.detach().cpu()),
+        "probe_perplexity": exp_clamped(float(probe_loss.detach().cpu())),
+        "probe_logits_mean": float(logits.detach().float().mean().cpu()),
+        "probe_logits_std": tensor_std(logits),
+        "probe_logits_max_abs": tensor_max_abs(logits),
+        "probe_logit_entropy": float(entropy.detach().cpu()),
+        "probe_confidence": float(confidence.detach().cpu()),
+        "probe_top2_margin": float(top2_margin.detach().cpu()),
+        "probe_token_embed_rms": tensor_rms(captured["token_embed"]),
+        "probe_final_hidden_rms": tensor_rms(captured["final_norm"]),
+        "probe_attention_output_rms_mean": layer_mean("attention_output_rms"),
+        "probe_feedforward_output_rms_mean": layer_mean("feedforward_output_rms"),
+        "probe_block_delta_rms_mean": layer_mean("block_delta_rms"),
+    }
+    for key in (
+        "rope_orthogonality_defect_mean",
+        "rope_relativity_defect_mean",
+        "rope_reversibility_defect_mean",
+        "rope_commutator_defect_mean",
+        "rope_attention_logit_path_error_mean",
+        "rope_block_mixing_offdiag_mean",
+        "rope_identity_deviation_mean",
+        "rope_pair_cosine_similarity_mean",
+        "rope_raw_reflector_norm_mean",
+        "rope_reflector_gradient_norm_mean",
+    ):
+        value = layer_mean(key)
+        if value is not None:
+            summary[key] = value
+    return {
+        "summary": summary,
+        "layers": layer_metrics,
+    }
+
+
+def log_training_record(variant_label: str, record: dict[str, Any], train_steps: int) -> None:
+    probe_entropy = "n/a" if "probe_logit_entropy" not in record else f"{record['probe_logit_entropy']:.3f}"
+    rope_orth = "n/a" if "rope_orthogonality_defect_mean" not in record else f"{record['rope_orthogonality_defect_mean']:.2e}"
+    eval_loss = "n/a" if "eval_loss" not in record else f"{record['eval_loss']:.4f}"
+    LOGGER.info(
+        "%s | step %d/%d | train_loss=%.4f | train_ppl=%.2f | eval_loss=%s | grad_norm=%.4f | tok/s=%.1f | probe_entropy=%s | rope_orth=%s",
+        variant_label,
+        record["step"],
+        train_steps,
+        record["train_loss"],
+        record["train_perplexity"],
+        eval_loss,
+        record["grad_global_norm"],
+        record["tokens_per_second"],
+        probe_entropy,
+        rope_orth,
+    )
 
 
 def run_torch_variant(
@@ -483,23 +918,35 @@ def run_torch_variant(
         variant=variant,
     ).to(device)
     parameter_count = count_torch_parameters(base_model)
-    model = base_model
+    train_model: nn.Module = base_model
     if config.use_compile and hasattr(torch, "compile") and device.type == "cuda":
-        model = torch.compile(base_model)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+        train_model = torch.compile(base_model)
+    optimizer = torch.optim.AdamW(base_model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     train_iter = batch_iterator(splits["train"], config.batch_size, shuffle=True, seed=config.seed)
     use_bf16 = bool(config.use_bf16 and device.type == "cuda" and torch.cuda.is_bf16_supported())
-    history: list[dict[str, float]] = []
+    history: list[dict[str, Any]] = []
     tokens_per_step = config.batch_size * config.seq_len * config.gradient_accumulation_steps
+    history_jsonl_path = config.output_dir / f"{config.output_stem}_{variant.label}_history.jsonl"
+    history_csv_path = config.output_dir / f"{config.output_stem}_{variant.label}_history.csv"
+    if history_jsonl_path.exists():
+        history_jsonl_path.unlink()
+    if history_csv_path.exists():
+        history_csv_path.unlink()
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
+    log_variant_start(config, variant, backend="torch")
+    log_variant_paths(variant, history_jsonl_path=history_jsonl_path, history_csv_path=history_csv_path)
+
     for step in range(1, config.train_steps + 1):
+        train_model.train()
         step_start = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         train_loss_total = 0.0
+        last_batch: dict[str, np.ndarray] | None = None
         for _ in range(config.gradient_accumulation_steps):
             batch = next(train_iter)
+            last_batch = batch
             input_ids = torch.from_numpy(batch["input_ids"]).to(device)
             labels = torch.from_numpy(batch["labels"]).to(device)
             amp_context = (
@@ -508,52 +955,70 @@ def run_torch_variant(
                 else nullcontext()
             )
             with amp_context:
-                logits = model(input_ids)
+                logits = train_model(input_ids)
                 loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1))
             (loss / config.gradient_accumulation_steps).backward()
             train_loss_total += float(loss.detach().cpu())
+        grad_norm = gradient_global_norm(base_model.parameters())
         optimizer.step()
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         step_ms = (time.perf_counter() - step_start) * 1000.0
-        record = {
+        train_loss = train_loss_total / config.gradient_accumulation_steps
+        record: dict[str, Any] = {
             "step": step,
-            "train_loss": train_loss_total / config.gradient_accumulation_steps,
+            "train_loss": train_loss,
+            "train_perplexity": exp_clamped(train_loss),
             "step_ms": step_ms,
             "tokens_per_second": tokens_per_step / max(step_ms / 1000.0, 1.0e-9),
+            "grad_global_norm": grad_norm,
+            "parameter_global_norm": parameter_global_norm(base_model.parameters()),
+            "learning_rate": float(optimizer.param_groups[0]["lr"]),
         }
+        if device.type == "cuda":
+            record["memory_allocated_gb"] = float(torch.cuda.memory_allocated(device) / (1024**3))
+            record["peak_memory_gb"] = float(torch.cuda.max_memory_allocated(device) / (1024**3))
         if step % config.eval_every == 0 or step == config.train_steps:
             record["eval_loss"] = evaluate_torch(
-                model,
+                train_model,
                 splits["validation"],
                 batch_size=config.eval_batch_size,
                 eval_batches=config.eval_batches,
                 seed=config.seed,
                 device=device,
+                use_bf16=use_bf16,
             )
+        if (step % config.diagnostics_every == 0 or step == 1 or step == config.train_steps) and last_batch is not None:
+            diagnostics = collect_torch_probe_metrics(
+                base_model,
+                last_batch,
+                device=device,
+                use_bf16=use_bf16,
+                diagnostic_token_limit=config.diagnostic_token_limit,
+            )
+            record["diagnostics"] = diagnostics
+            record.update(diagnostics["summary"])
         history.append(record)
+        append_jsonl(history_jsonl_path, record)
+        if should_log_record(config, record):
+            log_training_record(variant.label, record, config.train_steps)
 
-    eval_history = [entry["eval_loss"] for entry in history if "eval_loss" in entry]
-    return {
-        "backend": "torch",
-        "variant": variant.label,
-        "num_reflectors": variant.num_reflectors,
-        "parameter_count": parameter_count,
-        "final_train_loss": history[-1]["train_loss"],
-        "final_eval_loss": eval_history[-1] if eval_history else None,
-        "mean_step_ms": float(statistics.mean(entry["step_ms"] for entry in history)),
-        "mean_tokens_per_second": float(statistics.mean(entry["tokens_per_second"] for entry in history)),
-        "peak_memory_gb": (
-            float(torch.cuda.max_memory_allocated(device) / (1024**3))
-            if device.type == "cuda"
-            else None
-        ),
-        "history": history,
-    }
+    write_history_csv(history, history_csv_path)
+    return summarize_variant_result(
+        backend="torch",
+        variant=variant,
+        parameter_count=parameter_count,
+        history=history,
+        peak_memory_gb=float(torch.cuda.max_memory_allocated(device) / (1024**3)) if device.type == "cuda" else None,
+        history_jsonl_path=history_jsonl_path,
+        history_csv_path=history_csv_path,
+    )
+
 
 def build_flax_runtime():
     try:
         import flax.linen as flax_nn
+        from flax.traverse_util import flatten_dict as flax_flatten_dict
         import jax
         import jax.numpy as jnp
         import optax
@@ -657,10 +1122,48 @@ def build_flax_runtime():
             return None
         if not stats:
             return None
-        for key in ("bytes_in_use", "peak_bytes_in_use", "bytes_reserved"):
+        for key in ("peak_bytes_in_use", "bytes_in_use", "bytes_reserved"):
             if key in stats:
                 return float(stats[key]) / (1024**3)
         return None
+
+    def summarize_flax_reflectors(params: Any) -> dict[str, float]:
+        flat = flax_flatten_dict(params, sep="/")
+        arrays = [leaf for key, leaf in flat.items() if key.endswith("reflectors")]
+        if not arrays:
+            return {}
+        norms = [np.asarray(jnp.linalg.norm(array, axis=-1)).reshape(-1) for array in arrays]
+        merged = np.concatenate(norms)
+        return {
+            "rope_raw_reflector_norm_mean": float(np.mean(merged)),
+            "rope_raw_reflector_norm_max": float(np.max(merged)),
+        }
+
+    def probe_flax_metrics(model: Any, params: Any, batch: dict[str, np.ndarray], diagnostic_token_limit: int) -> dict[str, Any]:
+        input_ids = jnp.asarray(batch["input_ids"][:, :diagnostic_token_limit])
+        labels = jnp.asarray(batch["labels"][:, :diagnostic_token_limit])
+        logits = model.apply({"params": params}, input_ids)
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        probs = jnp.exp(log_probs)
+        entropy = -jnp.sum(probs * log_probs, axis=-1).mean()
+        confidence = jnp.max(probs, axis=-1).mean()
+        top2 = jax.lax.top_k(probs, k=2)[0]
+        margin = (top2[..., 0] - top2[..., 1]).mean()
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
+        summary = {
+            "probe_tokens": int(input_ids.shape[1]),
+            "probe_batch_size": int(input_ids.shape[0]),
+            "probe_loss": float(loss),
+            "probe_perplexity": exp_clamped(float(loss)),
+            "probe_logits_mean": float(jnp.mean(logits)),
+            "probe_logits_std": float(jnp.std(logits)),
+            "probe_logits_max_abs": float(jnp.max(jnp.abs(logits))),
+            "probe_logit_entropy": float(entropy),
+            "probe_confidence": float(confidence),
+            "probe_top2_margin": float(margin),
+        }
+        summary.update(summarize_flax_reflectors(params))
+        return {"summary": summary, "layers": {}}
 
     def run_flax_variant(
         config: RealDataHarnessConfig,
@@ -684,6 +1187,18 @@ def build_flax_runtime():
         parameter_count = count_jax_parameters(params)
         optimizer = optax.adamw(learning_rate=config.learning_rate, weight_decay=config.weight_decay)
         opt_state = optimizer.init(params)
+        history: list[dict[str, Any]] = []
+        train_iter = batch_iterator(splits["train"], config.batch_size, shuffle=True, seed=config.seed)
+        tokens_per_step = config.batch_size * config.seq_len * config.gradient_accumulation_steps
+        history_jsonl_path = config.output_dir / f"{config.output_stem}_{variant.label}_history.jsonl"
+        history_csv_path = config.output_dir / f"{config.output_stem}_{variant.label}_history.csv"
+        if history_jsonl_path.exists():
+            history_jsonl_path.unlink()
+        if history_csv_path.exists():
+            history_csv_path.unlink()
+
+        log_variant_start(config, variant, backend="flax")
+        log_variant_paths(variant, history_jsonl_path=history_jsonl_path, history_csv_path=history_csv_path)
 
         def loss_fn(current_params, input_ids, labels):
             logits = model.apply({"params": current_params}, input_ids)
@@ -694,31 +1209,51 @@ def build_flax_runtime():
             loss, grads = jax.value_and_grad(loss_fn)(current_params, input_ids, labels)
             updates, next_opt_state = optimizer.update(grads, current_opt_state, current_params)
             next_params = optax.apply_updates(current_params, updates)
-            return next_params, next_opt_state, loss
+            return (
+                next_params,
+                next_opt_state,
+                loss,
+                optax.global_norm(grads),
+                optax.global_norm(current_params),
+                optax.global_norm(updates),
+            )
 
         @jax.jit
         def eval_step(current_params, input_ids, labels):
             return loss_fn(current_params, input_ids, labels)
 
-        history: list[dict[str, float]] = []
-        train_iter = batch_iterator(splits["train"], config.batch_size, shuffle=True, seed=config.seed)
-        tokens_per_step = config.batch_size * config.seq_len * config.gradient_accumulation_steps
-
         for step in range(1, config.train_steps + 1):
             step_start = time.perf_counter()
             train_loss_total = 0.0
+            grad_norm = 0.0
+            param_norm = 0.0
+            update_norm = 0.0
+            last_batch: dict[str, np.ndarray] | None = None
             for _ in range(config.gradient_accumulation_steps):
                 batch = next(train_iter)
-                input_ids = jnp.asarray(batch["input_ids"])
-                labels = jnp.asarray(batch["labels"])
-                params, opt_state, loss = train_step(params, opt_state, input_ids, labels)
+                last_batch = batch
+                params, opt_state, loss, grad_norm_value, param_norm_value, update_norm_value = train_step(
+                    params,
+                    opt_state,
+                    jnp.asarray(batch["input_ids"]),
+                    jnp.asarray(batch["labels"]),
+                )
                 train_loss_total += float(jax.device_get(loss))
+                grad_norm = float(jax.device_get(grad_norm_value))
+                param_norm = float(jax.device_get(param_norm_value))
+                update_norm = float(jax.device_get(update_norm_value))
             step_ms = (time.perf_counter() - step_start) * 1000.0
-            record = {
+            train_loss = train_loss_total / config.gradient_accumulation_steps
+            record: dict[str, Any] = {
                 "step": step,
-                "train_loss": train_loss_total / config.gradient_accumulation_steps,
+                "train_loss": train_loss,
+                "train_perplexity": exp_clamped(train_loss),
                 "step_ms": step_ms,
                 "tokens_per_second": tokens_per_step / max(step_ms / 1000.0, 1.0e-9),
+                "grad_global_norm": grad_norm,
+                "parameter_global_norm": param_norm,
+                "update_global_norm": update_norm,
+                "learning_rate": config.learning_rate,
             }
             if step % config.eval_every == 0 or step == config.train_steps:
                 eval_losses: list[float] = []
@@ -734,26 +1269,68 @@ def build_flax_runtime():
                     loss = eval_step(params, jnp.asarray(batch["input_ids"]), jnp.asarray(batch["labels"]))
                     eval_losses.append(float(jax.device_get(loss)))
                 record["eval_loss"] = float(np.mean(eval_losses))
+            if (step % config.diagnostics_every == 0 or step == 1 or step == config.train_steps) and last_batch is not None:
+                diagnostics = probe_flax_metrics(model, params, last_batch, config.diagnostic_token_limit)
+                record["diagnostics"] = diagnostics
+                record.update(diagnostics["summary"])
             history.append(record)
+            append_jsonl(history_jsonl_path, record)
+            if should_log_record(config, record):
+                log_training_record(variant.label, record, config.train_steps)
 
-        eval_history = [entry["eval_loss"] for entry in history if "eval_loss" in entry]
-        return {
-            "backend": "flax",
-            "variant": variant.label,
-            "num_reflectors": variant.num_reflectors,
-            "parameter_count": parameter_count,
-            "final_train_loss": history[-1]["train_loss"],
-            "final_eval_loss": eval_history[-1] if eval_history else None,
-            "mean_step_ms": float(statistics.mean(entry["step_ms"] for entry in history)),
-            "mean_tokens_per_second": float(statistics.mean(entry["tokens_per_second"] for entry in history)),
-            "peak_memory_gb": maybe_jax_memory_gb(),
-            "history": history,
-        }
+        write_history_csv(history, history_csv_path)
+        return summarize_variant_result(
+            backend="flax",
+            variant=variant,
+            parameter_count=parameter_count,
+            history=history,
+            peak_memory_gb=maybe_jax_memory_gb(),
+            history_jsonl_path=history_jsonl_path,
+            history_csv_path=history_csv_path,
+        )
 
     return run_flax_variant, jax
 
 
-def plot_results(results: list[dict[str, Any]], *, loss_curve_path: Path, throughput_path: Path) -> None:
+def plot_metric_grid(
+    results: list[dict[str, Any]],
+    *,
+    specs: list[tuple[str, str, str]],
+    path: Path,
+    title: str,
+) -> None:
+    plt = import_plot_runtime()
+    figure, axes = plt.subplots(2, 2, figsize=(12, 8))
+    for axis, (key, panel_title, ylabel) in zip(axes.flat, specs):
+        any_series = False
+        for result in results:
+            steps, values = history_series(result["history"], key)
+            if not values:
+                continue
+            axis.plot(steps, values, label=result["variant"])
+            any_series = True
+        axis.set_title(panel_title)
+        axis.set_xlabel("Step")
+        axis.set_ylabel(ylabel)
+        if any_series:
+            axis.legend(fontsize=8)
+        else:
+            axis.text(0.5, 0.5, "No data", ha="center", va="center", transform=axis.transAxes)
+    figure.suptitle(title)
+    figure.tight_layout()
+    figure.savefig(path, dpi=160)
+    plt.close(figure)
+
+
+def plot_results(
+    results: list[dict[str, Any]],
+    *,
+    loss_curve_path: Path,
+    throughput_path: Path,
+    dynamics_path: Path,
+    component_path: Path,
+    rope_path: Path,
+) -> None:
     plt = import_plot_runtime()
 
     plt.figure(figsize=(10, 4.5))
@@ -783,6 +1360,40 @@ def plot_results(results: list[dict[str, Any]], *, loss_curve_path: Path, throug
     plt.savefig(throughput_path, dpi=160)
     plt.close()
 
+    plot_metric_grid(
+        results,
+        specs=[
+            ("grad_global_norm", "Gradient norm", "L2 norm"),
+            ("parameter_global_norm", "Parameter norm", "L2 norm"),
+            ("probe_logit_entropy", "Probe logit entropy", "Entropy"),
+            ("probe_confidence", "Probe confidence", "Probability"),
+        ],
+        path=dynamics_path,
+        title="Householder-RoPE training dynamics",
+    )
+    plot_metric_grid(
+        results,
+        specs=[
+            ("probe_token_embed_rms", "Token embedding RMS", "RMS"),
+            ("probe_attention_output_rms_mean", "Attention output RMS", "RMS"),
+            ("probe_feedforward_output_rms_mean", "Feed-forward output RMS", "RMS"),
+            ("probe_final_hidden_rms", "Final hidden RMS", "RMS"),
+        ],
+        path=component_path,
+        title="Householder-RoPE component diagnostics",
+    )
+    plot_metric_grid(
+        results,
+        specs=[
+            ("rope_orthogonality_defect_mean", "RoPE orthogonality defect", "Relative error"),
+            ("rope_identity_deviation_mean", "Identity deviation", "Relative error"),
+            ("rope_block_mixing_offdiag_mean", "Off-block mixing energy", "Energy"),
+            ("rope_attention_logit_path_error_mean", "Dense vs matrix-free logit error", "Relative error"),
+        ],
+        path=rope_path,
+        title="Householder-RoPE transport diagnostics",
+    )
+
 
 def write_summary_csv(results: list[dict[str, Any]], path: Path) -> None:
     header = [
@@ -791,37 +1402,67 @@ def write_summary_csv(results: list[dict[str, Any]], path: Path) -> None:
         "num_reflectors",
         "parameter_count",
         "final_train_loss",
+        "final_train_perplexity",
         "final_eval_loss",
         "mean_step_ms",
         "mean_tokens_per_second",
+        "mean_grad_global_norm",
+        "mean_parameter_global_norm",
         "peak_memory_gb",
+        "latest_probe_loss",
+        "latest_probe_logit_entropy",
+        "latest_probe_confidence",
+        "latest_rope_orthogonality_defect_mean",
+        "latest_rope_identity_deviation_mean",
+        "history_jsonl_path",
+        "history_csv_path",
     ]
-    rows = [
-        [
-            result["variant"],
-            result["backend"],
-            result["num_reflectors"],
-            result["parameter_count"],
-            result["final_train_loss"],
-            result["final_eval_loss"],
-            result["mean_step_ms"],
-            result["mean_tokens_per_second"],
-            result["peak_memory_gb"],
-        ]
-        for result in results
-    ]
-    lines = [",".join(header)] + [",".join(str(item) for item in row) for row in rows]
+    rows = []
+    for result in results:
+        latest_probe_summary = result.get("latest_probe_summary") or {}
+        rows.append(
+            [
+                result["variant"],
+                result["backend"],
+                result["num_reflectors"],
+                result["parameter_count"],
+                result["final_train_loss"],
+                result["final_train_perplexity"],
+                result["final_eval_loss"],
+                result["mean_step_ms"],
+                result["mean_tokens_per_second"],
+                result["mean_grad_global_norm"],
+                result["mean_parameter_global_norm"],
+                result["peak_memory_gb"],
+                latest_probe_summary.get("probe_loss"),
+                latest_probe_summary.get("probe_logit_entropy"),
+                latest_probe_summary.get("probe_confidence"),
+                latest_probe_summary.get("rope_orthogonality_defect_mean"),
+                latest_probe_summary.get("rope_identity_deviation_mean"),
+                result["history_jsonl_path"],
+                result["history_csv_path"],
+            ]
+        )
+    lines = [",".join(header)] + [",".join("" if item is None else str(item) for item in row) for row in rows]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
 
 def print_summary(results: list[dict[str, Any]]) -> None:
     for result in results:
+        latest_probe_summary = result.get("latest_probe_summary") or {}
         LOGGER.info(
-            "%s | backend=%s | final_eval_loss=%s | mean_step_ms=%.3f | tokens_per_second=%.1f",
+            "%s | backend=%s | final_eval_loss=%s | mean_step_ms=%.3f | tokens_per_second=%.1f | probe_entropy=%s | rope_orth=%s",
             result["variant"],
             result["backend"],
             "n/a" if result["final_eval_loss"] is None else f"{result['final_eval_loss']:.4f}",
             result["mean_step_ms"],
             result["mean_tokens_per_second"],
+            "n/a"
+            if latest_probe_summary.get("probe_logit_entropy") is None
+            else f"{latest_probe_summary['probe_logit_entropy']:.3f}",
+            "n/a"
+            if latest_probe_summary.get("rope_orthogonality_defect_mean") is None
+            else f"{latest_probe_summary['rope_orthogonality_defect_mean']:.2e}",
         )
 
 
@@ -844,6 +1485,9 @@ def main() -> None:
         train_steps=args.train_steps,
         eval_every=args.eval_every,
         eval_batches=args.eval_batches,
+        log_every=args.log_every,
+        diagnostics_every=args.diagnostics_every,
+        diagnostic_token_limit=args.diagnostic_token_limit,
         num_layers=args.num_layers,
         embed_dim=args.embed_dim,
         num_heads=args.num_heads,
@@ -863,6 +1507,7 @@ def main() -> None:
             f"embed_dim={config.embed_dim} must be divisible by num_heads={config.num_heads}."
         )
 
+    config.output_dir.mkdir(parents=True, exist_ok=True)
     seed_everything(config.seed, backend=backend)
     LOGGER.info(
         "Building realistic-data dataset pipeline for %s/%s",
@@ -895,28 +1540,49 @@ def main() -> None:
 
     results = [run_variant(variant) for variant in variants]
 
-    config.output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = config.output_dir / f"{config.output_stem}_metrics.json"
     summary_path = config.output_dir / f"{config.output_stem}_summary.csv"
     loss_curve_path = config.output_dir / f"{config.output_stem}_loss_curves.png"
     throughput_path = config.output_dir / f"{config.output_stem}_throughput.png"
+    dynamics_path = config.output_dir / f"{config.output_stem}_training_dynamics.png"
+    component_path = config.output_dir / f"{config.output_stem}_component_diagnostics.png"
+    rope_path = config.output_dir / f"{config.output_stem}_rope_diagnostics.png"
 
     payload = {
         "config": config.to_dict(),
         "environment": environment,
         "dataset_summary": dataset_summary,
         "variants": [to_serializable(asdict(variant)) for variant in variants],
+        "artifact_paths": {
+            "metrics": str(metrics_path),
+            "summary": str(summary_path),
+            "loss_curves": str(loss_curve_path),
+            "throughput": str(throughput_path),
+            "training_dynamics": str(dynamics_path),
+            "component_diagnostics": str(component_path),
+            "rope_diagnostics": str(rope_path),
+        },
         "results": results,
     }
     metrics_path.write_text(json.dumps(to_serializable(payload), indent=2), encoding="utf-8")
     write_summary_csv(results, summary_path)
-    plot_results(results, loss_curve_path=loss_curve_path, throughput_path=throughput_path)
+    plot_results(
+        results,
+        loss_curve_path=loss_curve_path,
+        throughput_path=throughput_path,
+        dynamics_path=dynamics_path,
+        component_path=component_path,
+        rope_path=rope_path,
+    )
     print_summary(results)
 
     LOGGER.info("Wrote metrics to %s", metrics_path)
     LOGGER.info("Wrote summary to %s", summary_path)
     LOGGER.info("Wrote loss curves to %s", loss_curve_path)
     LOGGER.info("Wrote throughput plot to %s", throughput_path)
+    LOGGER.info("Wrote training dynamics plot to %s", dynamics_path)
+    LOGGER.info("Wrote component diagnostics plot to %s", component_path)
+    LOGGER.info("Wrote RoPE diagnostics plot to %s", rope_path)
 
 
 if __name__ == "__main__":

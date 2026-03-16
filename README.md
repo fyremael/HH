@@ -71,10 +71,10 @@ python scripts/run_attention_block_benchmark.py --scenario-set long_context_gpu 
 python scripts/plot_attention_block_benchmark.py --inputs artifacts/attention_block_benchmark_wsl_pinned_large.json artifacts/attention_block_benchmark_wsl_pinned_long_context.json --output-prefix artifacts/attention_block_sequence_sweep
 ```
 
-For a realistic-data single-device run outside Colab, use the reusable harness:
+For a realistic-data single-device run outside Colab, use the reusable harness. It now streams ongoing training metrics to the console during the run, writes per-variant JSONL and CSV histories, and saves dedicated diagnostics plots alongside the loss and throughput summaries:
 
 ```bash
-python scripts/run_real_data_scale_harness.py --train-steps 20 --reflector-sweep 0 8 --output-stem realistic_data_smoke
+python scripts/run_real_data_scale_harness.py --train-steps 20 --reflector-sweep 0 8 --log-every 5 --diagnostics-every 10 --diagnostic-token-limit 96 --output-stem realistic_data_smoke
 ```
 
 For a WSL GPU comparison run with `uv`, where Ubuntu already has working CUDA-enabled JAX and PyTorch in the system Python, use a shared-package `uv` environment and only overlay the minimal safe packages:
@@ -135,7 +135,7 @@ demo_householder_rope_jax.ipynb
 colab_householder_rope_scaling_harness.ipynb
 ```
 
-For a realistic A100 or TPU Colab run, open `colab_householder_rope_scaling_harness.ipynb`. Its first code cell will `git clone` the repo if needed and install the runtime with `uv`, then the notebook offers three A100-ready profiles: `fast_sanity`, `serious_comparison`, and `long_context_stress`. The default runs `scripts/run_real_data_scale_harness.py` on `wikitext-103-raw-v1`, compares `num_reflectors in {0, 8, 16}`, and writes JSON, CSV, and PNG artifacts into `artifacts/`.
+For a realistic A100 or TPU Colab run, open `colab_householder_rope_scaling_harness.ipynb`. Its first code cell will `git clone` the repo if needed and install the runtime with `uv`, then the notebook offers three A100-ready profiles: `fast_sanity`, `serious_comparison`, and `long_context_stress`. The default runs `scripts/run_real_data_scale_harness.py` on `wikitext-103-raw-v1`, compares `num_reflectors in {0, 8, 16}`, emits ongoing optimization diagnostics during training, and writes JSON, JSONL, CSV, and PNG artifacts into `artifacts/`, including dedicated training-dynamics, component-diagnostics, and RoPE-health plots.
 
 Minimal PyTorch usage:
 
