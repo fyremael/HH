@@ -25,4 +25,8 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "uv pip install --system" in joined_sources
     assert "wikitext-103-raw-v1" in joined_sources
     assert "run_real_data_scale_harness.py" in joined_sources
-    assert "colab_a100_wikitext103" in joined_sources
+    assert "A100_PRESETS" in joined_sources
+    assert "fast_sanity" in joined_sources
+    assert "serious_comparison" in joined_sources
+    assert "long_context_stress" in joined_sources
+    assert 'ACTIVE_PROFILE = "serious_comparison"' in joined_sources
