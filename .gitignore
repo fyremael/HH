@@ -3,3 +3,4 @@ __pycache__/
 .venv*/
 .codex_*
 pytest-cache-files-*/
+*.egg-info/
