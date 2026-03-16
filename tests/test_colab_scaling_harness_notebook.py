@@ -21,6 +21,8 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "## Next steps" in intro
     assert "40GB A100" in intro
     assert "logs stream live" in intro or "stream live" in intro
+    assert "num_reflectors in {0, 16, 32}" in intro
+    assert "2048-token" in intro
 
     joined_sources = "\n".join(cell["source"] for cell in cells)
     assert 'run_command("git", "clone"' in joined_sources
@@ -31,13 +33,16 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "A100_PRESETS" in joined_sources
     assert "fast_sanity" in joined_sources
     assert "serious_comparison" in joined_sources
+    assert "geometry_signal" in joined_sources
     assert "long_context_stress" in joined_sources
-    assert 'ACTIVE_PROFILE = "serious_comparison"' in joined_sources
-    assert '"seq_len": 1024' in joined_sources
-    assert '"batch_size": 6' in joined_sources
+    assert 'ACTIVE_PROFILE = "geometry_signal"' in joined_sources
+    assert '"seq_len": 2048' in joined_sources
+    assert '"batch_size": 3' in joined_sources
+    assert '"train_steps": 600' in joined_sources
     assert '"num_layers": 6' in joined_sources
     assert '"embed_dim": 1024' in joined_sources
     assert '"num_heads": 16' in joined_sources
+    assert '"reflector_sweep": [0, 16, 32]' in joined_sources
     assert "log_every" in joined_sources
     assert "diagnostics_every" in joined_sources
     assert "diagnostic_token_limit" in joined_sources
