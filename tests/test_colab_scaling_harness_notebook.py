@@ -23,6 +23,7 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "stream" in intro
     assert "4096-token" in intro
     assert "VRAM" in intro
+    assert "capacity-limit run" in intro or "capacity-max run" in intro
 
     joined_sources = "\n".join(cell["source"] for cell in cells)
     assert 'run_command("git", "clone"' in joined_sources
@@ -35,14 +36,15 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "serious_comparison" in joined_sources
     assert "geometry_signal" in joined_sources
     assert "capacity_limit" in joined_sources
+    assert "capacity_max" in joined_sources
     assert "long_context_stress" in joined_sources
-    assert 'ACTIVE_PROFILE = "capacity_limit"' in joined_sources
+    assert 'ACTIVE_PROFILE = "capacity_max"' in joined_sources
     assert '"seq_len": 4096' in joined_sources
-    assert '"batch_size": 4' in joined_sources
-    assert '"train_steps": 400' in joined_sources
-    assert '"num_layers": 12' in joined_sources
-    assert '"embed_dim": 1536' in joined_sources
-    assert '"num_heads": 24' in joined_sources
+    assert '"batch_size": 8' in joined_sources
+    assert '"train_steps": 300' in joined_sources
+    assert '"num_layers": 24' in joined_sources
+    assert '"embed_dim": 2048' in joined_sources
+    assert '"num_heads": 32' in joined_sources
     assert '"reflector_sweep": [0, 16, 32]' in joined_sources
     assert "log_every" in joined_sources
     assert "diagnostics_every" in joined_sources
@@ -60,4 +62,8 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "stdout=subprocess.PIPE" in joined_sources
     assert "stderr=subprocess.STDOUT" in joined_sources
     assert "for line in process.stdout" in joined_sources
-    assert "If this profile OOMs, switch ACTIVE_PROFILE to 'geometry_signal'." in joined_sources
+    assert "If this profile OOMs, switch ACTIVE_PROFILE to 'capacity_limit', then 'geometry_signal'." in joined_sources
+    assert "mean_tokens_per_second" in joined_sources
+    assert "peak_memory_gb" in joined_sources
+    assert "eval_loss_delta_vs_standard" in joined_sources
+    assert "throughput_ratio_vs_standard" in joined_sources
