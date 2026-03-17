@@ -885,9 +885,18 @@ def collect_torch_probe_metrics(
 def log_training_record(variant_label: str, record: dict[str, Any], train_steps: int) -> None:
     probe_entropy = "n/a" if "probe_logit_entropy" not in record else f"{record['probe_logit_entropy']:.3f}"
     rope_orth = "n/a" if "rope_orthogonality_defect_mean" not in record else f"{record['rope_orthogonality_defect_mean']:.2e}"
+    rope_identity = (
+        "n/a"
+        if "rope_identity_deviation_mean" not in record
+        else f"{record['rope_identity_deviation_mean']:.4f}"
+    )
     eval_loss = "n/a" if "eval_loss" not in record else f"{record['eval_loss']:.4f}"
+    memory = "n/a"
+    if "memory_allocated_gb" in record:
+        peak = record.get("peak_memory_gb", record["memory_allocated_gb"])
+        memory = f"{record['memory_allocated_gb']:.2f}/{peak:.2f}GB"
     LOGGER.info(
-        "%s | step %d/%d | train_loss=%.4f | train_ppl=%.2f | eval_loss=%s | grad_norm=%.4f | tok/s=%.1f | probe_entropy=%s | rope_orth=%s",
+        "%s | step %d/%d | train_loss=%.4f | train_ppl=%.2f | eval_loss=%s | grad_norm=%.4f | tok/s=%.1f | mem=%s | probe_entropy=%s | rope_orth=%s | rope_id=%s",
         variant_label,
         record["step"],
         train_steps,
@@ -896,8 +905,10 @@ def log_training_record(variant_label: str, record: dict[str, Any], train_steps:
         eval_loss,
         record["grad_global_norm"],
         record["tokens_per_second"],
+        memory,
         probe_entropy,
         rope_orth,
+        rope_identity,
     )
 
 
