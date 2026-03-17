@@ -23,7 +23,7 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "stream" in intro
     assert "4096-token" in intro
     assert "VRAM" in intro
-    assert "capacity-limit run" in intro or "capacity-max run" in intro
+    assert "backs off the batch size" in intro
 
     joined_sources = "\n".join(cell["source"] for cell in cells)
     assert 'run_command("git", "clone"' in joined_sources
@@ -54,6 +54,7 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "rope_diagnostics.png" in joined_sources
     assert "history_jsonl_path" in joined_sources
     assert 'PYTHONUNBUFFERED="1"' in joined_sources
+    assert 'PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"' in joined_sources
     assert '"-u"' in joined_sources
     assert '"--log-level"' in joined_sources
     assert '"INFO"' in joined_sources
@@ -62,7 +63,14 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "stdout=subprocess.PIPE" in joined_sources
     assert "stderr=subprocess.STDOUT" in joined_sources
     assert "for line in process.stdout" in joined_sources
-    assert "If this profile OOMs, switch ACTIVE_PROFILE to 'capacity_limit', then 'geometry_signal'." in joined_sources
+    assert "candidate_batches = list(range" in joined_sources
+    assert "run_command_stream" in joined_sources
+    assert "Attempting batch_size=" in joined_sources
+    assert "CUDA OOM at batch_size=" in joined_sources
+    assert "Run succeeded with batch_size=" in joined_sources
+    assert "RUN_OUTPUT_STEM" in joined_sources
+    assert "attempted_batches" in joined_sources
+    assert "Effective batch size:" in joined_sources
     assert "mean_tokens_per_second" in joined_sources
     assert "peak_memory_gb" in joined_sources
     assert "eval_loss_delta_vs_standard" in joined_sources
