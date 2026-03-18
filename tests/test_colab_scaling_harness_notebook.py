@@ -9,6 +9,9 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert notebook["nbformat"] == 4
     cells = notebook["cells"]
     assert cells, "Notebook should contain cells."
+    for index, cell in enumerate(cells):
+        if cell["cell_type"] == "code":
+            compile(cell["source"], f"colab_householder_rope_scaling_harness.ipynb cell {index}", "exec")
 
     first_cell = cells[0]
     assert first_cell["cell_type"] == "markdown"
@@ -68,6 +71,8 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "Attempting batch_size=" in joined_sources
     assert "CUDA OOM at batch_size=" in joined_sources
     assert "Run succeeded with batch_size=" in joined_sources
+    assert 'print("+", " ".join(command), flush=True)' in joined_sources
+    assert r' \".join(command)' not in joined_sources
     assert "RUN_OUTPUT_STEM" in joined_sources
     assert "attempted_batches" in joined_sources
     assert "Effective batch size:" in joined_sources
