@@ -39,15 +39,15 @@ def test_config_to_dict_serializes_output_dir() -> None:
         dataset_name="wikitext",
         dataset_config="wikitext-103-raw-v1",
         tokenizer_name="gpt2",
-        train_text_limit=8,
-        eval_text_limit=4,
+        train_text_limit=None,
+        eval_text_limit=None,
         seq_len=16,
         batch_size=2,
         eval_batch_size=2,
         gradient_accumulation_steps=1,
         train_steps=1,
         eval_every=1,
-        eval_batches=1,
+        eval_batches=None,
         log_every=1,
         diagnostics_every=1,
         diagnostic_token_limit=8,
@@ -69,6 +69,20 @@ def test_config_to_dict_serializes_output_dir() -> None:
     assert payload["output_dir"] == str(output_dir)
     assert payload["reflector_sweep"] == (0, 8)
     assert payload["diagnostics_every"] == 1
+    assert payload["train_text_limit"] is None
+    assert payload["eval_batches"] is None
+
+
+def test_parse_optional_record_limit_accepts_full_keywords() -> None:
+    assert MODULE.parse_optional_record_limit("full") is None
+    assert MODULE.parse_optional_record_limit("ALL") is None
+    assert MODULE.parse_optional_record_limit("12") == 12
+
+
+def test_parse_optional_eval_batches_accepts_full_keywords_and_zero() -> None:
+    assert MODULE.parse_optional_eval_batches("full") is None
+    assert MODULE.parse_optional_eval_batches("0") is None
+    assert MODULE.parse_optional_eval_batches("7") == 7
 
 
 def test_reduce_rope_diagnostics_summarizes_nested_metrics() -> None:

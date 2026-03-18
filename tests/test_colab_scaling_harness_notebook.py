@@ -24,11 +24,12 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "## Next steps" in intro
     assert "40GB A100" in intro
     assert "stream" in intro
-    assert "4096-token" in intro
-    assert "VRAM" in intro
+    assert "2048-token" in intro
+    assert "full Wikitext-103 train and validation splits" in intro
     assert "backs off the batch size" in intro
     assert "all the way down to 1" in intro
     assert "gradient accumulation" in intro
+    assert "full validation sweeps" in intro
 
     joined_sources = "\n".join(cell["source"] for cell in cells)
     assert 'run_command("git", "clone"' in joined_sources
@@ -39,17 +40,21 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "A100_PRESETS" in joined_sources
     assert "fast_sanity" in joined_sources
     assert "serious_comparison" in joined_sources
+    assert "full_signal" in joined_sources
     assert "geometry_signal" in joined_sources
     assert "capacity_limit" in joined_sources
     assert "capacity_max" in joined_sources
     assert "long_context_stress" in joined_sources
-    assert 'ACTIVE_PROFILE = "capacity_max"' in joined_sources
-    assert '"seq_len": 4096' in joined_sources
-    assert '"batch_size": 8' in joined_sources
-    assert '"train_steps": 300' in joined_sources
-    assert '"num_layers": 24' in joined_sources
-    assert '"embed_dim": 2048' in joined_sources
-    assert '"num_heads": 32' in joined_sources
+    assert 'ACTIVE_PROFILE = "full_signal"' in joined_sources
+    assert '"train_text_limit": None' in joined_sources
+    assert '"eval_text_limit": None' in joined_sources
+    assert '"eval_batches": None' in joined_sources
+    assert '"seq_len": 2048' in joined_sources
+    assert '"batch_size": 6' in joined_sources
+    assert '"train_steps": 1200' in joined_sources
+    assert '"num_layers": 16' in joined_sources
+    assert '"embed_dim": 1536' in joined_sources
+    assert '"num_heads": 24' in joined_sources
     assert '"reflector_sweep": [0, 16, 32]' in joined_sources
     assert "log_every" in joined_sources
     assert "diagnostics_every" in joined_sources
@@ -63,6 +68,8 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert '"-u"' in joined_sources
     assert '"--log-level"' in joined_sources
     assert '"INFO"' in joined_sources
+    assert "append_optional_flag" in joined_sources
+    assert 'serialized = "full" if value is None else str(value)' in joined_sources
     assert "Live harness logs will stream below." in joined_sources
     assert "subprocess.Popen(" in joined_sources
     assert "stdout=subprocess.PIPE" in joined_sources
@@ -84,6 +91,8 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "Effective batch size:" in joined_sources
     assert "Effective gradient accumulation:" in joined_sources
     assert "Effective tokens per optimizer step:" in joined_sources
+    assert "Evaluation mode:" in joined_sources
+    assert "full validation" in joined_sources
     assert "mean_tokens_per_second" in joined_sources
     assert "peak_memory_gb" in joined_sources
     assert "eval_loss_delta_vs_standard" in joined_sources

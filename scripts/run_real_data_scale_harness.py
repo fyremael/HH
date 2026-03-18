@@ -52,15 +52,15 @@ class RealDataHarnessConfig:
     dataset_name: str
     dataset_config: str
     tokenizer_name: str
-    train_text_limit: int
-    eval_text_limit: int
+    train_text_limit: int | None
+    eval_text_limit: int | None
     seq_len: int
     batch_size: int
     eval_batch_size: int
     gradient_accumulation_steps: int
     train_steps: int
     eval_every: int
-    eval_batches: int
+    eval_batches: int | None
     log_every: int
     diagnostics_every: int
     diagnostic_token_limit: int
@@ -82,6 +82,32 @@ class RealDataHarnessConfig:
         payload = asdict(self)
         payload["output_dir"] = str(self.output_dir)
         return payload
+
+
+def parse_optional_record_limit(value: str) -> int | None:
+    """Parse a positive record count or a full-split sentinel."""
+
+    normalized = value.strip().lower()
+    if normalized in {"all", "full", "none"}:
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("Expected a positive integer or one of: all, full, none.")
+    return parsed
+
+
+def parse_optional_eval_batches(value: str) -> int | None:
+    """Parse a positive validation-batch count or a full-validation sentinel."""
+
+    normalized = value.strip().lower()
+    if normalized in {"all", "full", "none"}:
+        return None
+    parsed = int(value)
+    if parsed == 0:
+        return None
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("Expected a non-negative integer or one of: all, full, none.")
+    return parsed
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,15 +133,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--train-text-limit",
-        type=int,
+        type=parse_optional_record_limit,
         default=12000,
-        help="How many raw training records to keep before tokenization.",
+        help="How many raw training records to keep before tokenization, or 'full' for the entire split.",
     )
     parser.add_argument(
         "--eval-text-limit",
-        type=int,
+        type=parse_optional_record_limit,
         default=1500,
-        help="How many raw validation records to keep before tokenization.",
+        help="How many raw validation records to keep before tokenization, or 'full' for the entire split.",
     )
     parser.add_argument("--seq-len", type=int, default=256, help="Token sequence length.")
     parser.add_argument("--batch-size", type=int, default=8, help="Training batch size.")
@@ -128,7 +154,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--train-steps", type=int, default=60, help="Optimizer steps per variant.")
     parser.add_argument("--eval-every", type=int, default=10, help="Evaluation frequency in steps.")
-    parser.add_argument("--eval-batches", type=int, default=8, help="Validation batches per eval.")
+    parser.add_argument(
+        "--eval-batches",
+        type=parse_optional_eval_batches,
+        default=8,
+        help="Validation batches per eval, or 'full' to sweep the entire validation split.",
+    )
     parser.add_argument(
         "--log-every",
         type=int,
@@ -343,9 +374,14 @@ def build_lm_splits(config: RealDataHarnessConfig):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    def maybe_select(split, limit: int | None):
+        if limit is None:
+            return split
+        return split.select(range(min(limit, len(split))))
+
     trimmed = {
-        "train": raw["train"].select(range(min(config.train_text_limit, len(raw["train"])))),
-        "validation": raw["validation"].select(range(min(config.eval_text_limit, len(raw["validation"])))),
+        "train": maybe_select(raw["train"], config.train_text_limit),
+        "validation": maybe_select(raw["validation"], config.eval_text_limit),
     }
 
     def tokenize_batch(batch: dict[str, list[str]]) -> dict[str, Any]:
@@ -382,6 +418,12 @@ def build_lm_splits(config: RealDataHarnessConfig):
         split.set_format(type="numpy", columns=["input_ids", "labels"])
 
     summary = {
+        "train_records_used": len(trimmed["train"]),
+        "validation_records_used": len(trimmed["validation"]),
+        "train_records_available": len(raw["train"]),
+        "validation_records_available": len(raw["validation"]),
+        "train_text_limit": config.train_text_limit,
+        "eval_text_limit": config.eval_text_limit,
         "train_sequences": len(grouped["train"]),
         "validation_sequences": len(grouped["validation"]),
         "vocab_size": int(tokenizer.vocab_size),
@@ -720,7 +762,7 @@ def evaluate_torch(
     split,
     *,
     batch_size: int,
-    eval_batches: int,
+    eval_batches: int | None,
     seed: int,
     device: torch.device,
     use_bf16: bool,
@@ -736,13 +778,15 @@ def evaluate_torch(
     )
     with torch.no_grad(), amp_context:
         for batch_index, batch in enumerate(iterator):
-            if batch_index >= eval_batches:
+            if eval_batches is not None and batch_index >= eval_batches:
                 break
             input_ids = torch.from_numpy(batch["input_ids"]).to(device)
             labels = torch.from_numpy(batch["labels"]).to(device)
             logits = model(input_ids)
             loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1))
             losses.append(float(loss.detach().cpu()))
+    if not losses:
+        raise ValueError("Validation loop produced no batches. Lower eval_batch_size or use a longer split.")
     model.train(training_state)
     return float(np.mean(losses))
 
@@ -1275,10 +1319,14 @@ def build_flax_runtime():
                     seed=config.seed,
                 )
                 for batch_index, batch in enumerate(eval_iter):
-                    if batch_index >= config.eval_batches:
+                    if config.eval_batches is not None and batch_index >= config.eval_batches:
                         break
                     loss = eval_step(params, jnp.asarray(batch["input_ids"]), jnp.asarray(batch["labels"]))
                     eval_losses.append(float(jax.device_get(loss)))
+                if not eval_losses:
+                    raise ValueError(
+                        "Validation loop produced no batches. Lower eval_batch_size or use a longer split."
+                    )
                 record["eval_loss"] = float(np.mean(eval_losses))
             if (step % config.diagnostics_every == 0 or step == 1 or step == config.train_steps) and last_batch is not None:
                 diagnostics = probe_flax_metrics(model, params, last_batch, config.diagnostic_token_limit)
@@ -1526,6 +1574,15 @@ def main() -> None:
         config.dataset_config,
     )
     _, splits, dataset_summary = build_lm_splits(config)
+    LOGGER.info(
+        "Dataset summary: train_records=%s/%s validation_records=%s/%s train_sequences=%s validation_sequences=%s",
+        dataset_summary["train_records_used"],
+        dataset_summary["train_records_available"],
+        dataset_summary["validation_records_used"],
+        dataset_summary["validation_records_available"],
+        dataset_summary["train_sequences"],
+        dataset_summary["validation_sequences"],
+    )
     ensure_split_sizes(config, dataset_summary)
     environment = collect_environment(backend)
     variants = build_variants(config.reflector_sweep, config.householder_init)
