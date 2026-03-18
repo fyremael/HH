@@ -27,6 +27,8 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "4096-token" in intro
     assert "VRAM" in intro
     assert "backs off the batch size" in intro
+    assert "all the way down to 1" in intro
+    assert "gradient accumulation" in intro
 
     joined_sources = "\n".join(cell["source"] for cell in cells)
     assert 'run_command("git", "clone"' in joined_sources
@@ -67,15 +69,21 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "stderr=subprocess.STDOUT" in joined_sources
     assert "for line in process.stdout" in joined_sources
     assert "candidate_batches = list(range" in joined_sources
+    assert "base_effective_batch" in joined_sources
+    assert "gradient_accumulation_steps" in joined_sources
     assert "run_command_stream" in joined_sources
     assert "Attempting batch_size=" in joined_sources
+    assert "gradient_accumulation_steps=" in joined_sources
     assert "CUDA OOM at batch_size=" in joined_sources
     assert "Run succeeded with batch_size=" in joined_sources
+    assert "_ga{run_config['gradient_accumulation_steps']}" in joined_sources
     assert 'print("+", " ".join(command), flush=True)' in joined_sources
     assert r' \".join(command)' not in joined_sources
     assert "RUN_OUTPUT_STEM" in joined_sources
     assert "attempted_batches" in joined_sources
     assert "Effective batch size:" in joined_sources
+    assert "Effective gradient accumulation:" in joined_sources
+    assert "Effective tokens per optimizer step:" in joined_sources
     assert "mean_tokens_per_second" in joined_sources
     assert "peak_memory_gb" in joined_sources
     assert "eval_loss_delta_vs_standard" in joined_sources
