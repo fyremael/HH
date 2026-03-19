@@ -30,8 +30,10 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "all the way down to 1" in intro
     assert "gradient accumulation" in intro
     assert "full validation sweeps" in intro
-    assert "re-evaluates HH variants with HH disabled" in intro
-    assert "intervention deltas" in intro
+    assert "HH disabled" in intro
+    assert "intervention" in intro
+    assert "folded into `q_proj/k_proj`" in intro
+    assert "fold-absorption deltas" in intro
 
     joined_sources = "\n".join(cell["source"] for cell in cells)
     assert 'run_command("git", "clone"' in joined_sources
@@ -102,6 +104,10 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "mean_tokens_per_second" in joined_sources
     assert "peak_memory_gb" in joined_sources
     assert "intervention_disable_hh_eval_delta" in joined_sources
+    assert "folded_eval_delta" in joined_sources
+    assert "folded_probe_logit_max_abs" in joined_sources
+    assert "fold_summary" in joined_sources
+    assert "fold_absorption_abs_delta" in joined_sources
     assert "eval_loss_delta_vs_standard" in joined_sources
     assert "throughput_ratio_vs_standard" in joined_sources
     assert "intervention_impact.png" in joined_sources

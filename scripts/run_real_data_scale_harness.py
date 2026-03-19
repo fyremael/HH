@@ -654,6 +654,7 @@ def summarize_variant_result(
     history_jsonl_path: Path,
     history_csv_path: Path,
     intervention_summary: dict[str, Any] | None = None,
+    fold_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     eval_history = [entry["eval_loss"] for entry in history if "eval_loss" in entry]
     latest_probe = latest_diagnostics(history)
@@ -684,6 +685,13 @@ def summarize_variant_result(
         "intervention_disable_hh_eval_delta_pct": None
         if intervention_summary is None
         else intervention_summary.get("disabled_minus_active_eval_loss_pct"),
+        "fold_summary": fold_summary,
+        "fold_active_eval_loss": None if fold_summary is None else fold_summary.get("active_eval_loss"),
+        "folded_eval_loss": None if fold_summary is None else fold_summary.get("folded_eval_loss"),
+        "folded_eval_delta": None if fold_summary is None else fold_summary.get("folded_minus_active_eval_loss"),
+        "folded_eval_delta_pct": None if fold_summary is None else fold_summary.get("folded_minus_active_eval_loss_pct"),
+        "folded_probe_logit_max_abs": None if fold_summary is None else fold_summary.get("folded_probe_logit_max_abs"),
+        "folded_probe_logit_rms": None if fold_summary is None else fold_summary.get("folded_probe_logit_rms"),
         "history_jsonl_path": str(history_jsonl_path),
         "history_csv_path": str(history_csv_path),
         "history": history,
@@ -784,6 +792,12 @@ def iter_torch_householder_ropes(model: nn.Module) -> Iterator[HouseholderRoPE]:
             yield module
 
 
+def iter_torch_householder_attentions(model: nn.Module) -> Iterator[HouseholderSelfAttention]:
+    for module in model.modules():
+        if isinstance(module, HouseholderSelfAttention) and isinstance(module.rope, HouseholderRoPE):
+            yield module
+
+
 @contextmanager
 def override_torch_householder_enabled(model: nn.Module, enabled: bool) -> Iterator[None]:
     ropes = list(iter_torch_householder_ropes(model))
@@ -795,6 +809,69 @@ def override_torch_householder_enabled(model: nn.Module, enabled: bool) -> Itera
     finally:
         for rope, previous_state in zip(ropes, previous_states):
             rope.config.enabled = previous_state
+
+
+@contextmanager
+def fold_torch_householder_into_projections(model: nn.Module) -> Iterator[None]:
+    attention_modules = list(iter_torch_householder_attentions(model))
+    snapshots: list[dict[str, Any]] = []
+    with torch.no_grad():
+        for attention in attention_modules:
+            rope = attention.rope
+            if rope is None or rope.config.num_reflectors == 0:
+                continue
+            q_weight = attention.q_proj.weight.detach().clone()
+            k_weight = attention.k_proj.weight.detach().clone()
+            q_bias = None if attention.q_proj.bias is None else attention.q_proj.bias.detach().clone()
+            k_bias = None if attention.k_proj.bias is None else attention.k_proj.bias.detach().clone()
+            snapshots.append(
+                {
+                    "attention": attention,
+                    "enabled": rope.config.enabled,
+                    "q_weight": q_weight,
+                    "k_weight": k_weight,
+                    "q_bias": q_bias,
+                    "k_bias": k_bias,
+                }
+            )
+
+            q_weight_view = attention.q_proj.weight.reshape(attention.num_heads, attention.head_dim, -1)
+            k_weight_view = attention.k_proj.weight.reshape(attention.num_heads, attention.head_dim, -1)
+            Q = rope.materialize_Q(expand_heads=True).to(
+                device=attention.q_proj.weight.device,
+                dtype=attention.q_proj.weight.dtype,
+            )
+            Q_transpose = Q.transpose(-1, -2)
+            attention.q_proj.weight.copy_(
+                torch.einsum("hij,hjk->hik", Q_transpose, q_weight_view).reshape_as(attention.q_proj.weight)
+            )
+            attention.k_proj.weight.copy_(
+                torch.einsum("hij,hjk->hik", Q_transpose, k_weight_view).reshape_as(attention.k_proj.weight)
+            )
+            if attention.q_proj.bias is not None:
+                q_bias_view = attention.q_proj.bias.reshape(attention.num_heads, attention.head_dim)
+                attention.q_proj.bias.copy_(
+                    torch.einsum("hd,hde->he", q_bias_view, Q).reshape_as(attention.q_proj.bias)
+                )
+            if attention.k_proj.bias is not None:
+                k_bias_view = attention.k_proj.bias.reshape(attention.num_heads, attention.head_dim)
+                attention.k_proj.bias.copy_(
+                    torch.einsum("hd,hde->he", k_bias_view, Q).reshape_as(attention.k_proj.bias)
+                )
+            rope.config.enabled = False
+    try:
+        yield
+    finally:
+        with torch.no_grad():
+            for snapshot in snapshots:
+                attention = snapshot["attention"]
+                attention.q_proj.weight.copy_(snapshot["q_weight"])
+                attention.k_proj.weight.copy_(snapshot["k_weight"])
+                if attention.q_proj.bias is not None and snapshot["q_bias"] is not None:
+                    attention.q_proj.bias.copy_(snapshot["q_bias"])
+                if attention.k_proj.bias is not None and snapshot["k_bias"] is not None:
+                    attention.k_proj.bias.copy_(snapshot["k_bias"])
+                attention.rope.config.enabled = snapshot["enabled"]
 
 
 def evaluate_torch(
@@ -871,6 +948,61 @@ def evaluate_torch_householder_intervention(
         "disabled_eval_loss": disabled_eval_loss,
         "disabled_minus_active_eval_loss": delta,
         "disabled_minus_active_eval_loss_pct": delta / active_eval_loss if active_eval_loss != 0.0 else 0.0,
+    }
+
+
+def evaluate_torch_householder_fold_absorption(
+    model: nn.Module,
+    split,
+    *,
+    variant: RopeVariant,
+    batch_size: int,
+    eval_batches: int | None,
+    seed: int,
+    device: torch.device,
+    use_bf16: bool,
+) -> dict[str, float | str] | None:
+    if variant.num_reflectors == 0:
+        return None
+
+    active_eval_loss = evaluate_torch(
+        model,
+        split,
+        batch_size=batch_size,
+        eval_batches=eval_batches,
+        seed=seed,
+        device=device,
+        use_bf16=use_bf16,
+    )
+    probe_batch = next(batch_iterator(split, batch_size, shuffle=False, seed=seed))
+    input_ids = torch.from_numpy(probe_batch["input_ids"]).to(device)
+    training_state = model.training
+    model.eval()
+    with torch.no_grad():
+        active_logits = model(input_ids).detach().float()
+    with fold_torch_householder_into_projections(model):
+        folded_eval_loss = evaluate_torch(
+            model,
+            split,
+            batch_size=batch_size,
+            eval_batches=eval_batches,
+            seed=seed,
+            device=device,
+            use_bf16=use_bf16,
+        )
+        with torch.no_grad():
+            folded_logits = model(input_ids).detach().float()
+    model.train(training_state)
+    logit_delta = folded_logits - active_logits
+    eval_delta = folded_eval_loss - active_eval_loss
+    return {
+        "kind": "fold_into_qk",
+        "active_eval_loss": active_eval_loss,
+        "folded_eval_loss": folded_eval_loss,
+        "folded_minus_active_eval_loss": eval_delta,
+        "folded_minus_active_eval_loss_pct": eval_delta / active_eval_loss if active_eval_loss != 0.0 else 0.0,
+        "folded_probe_logit_max_abs": float(logit_delta.abs().max().cpu()),
+        "folded_probe_logit_rms": tensor_rms(logit_delta),
     }
 
 
@@ -1142,6 +1274,7 @@ def run_torch_variant(
             log_training_record(variant.label, record, config.train_steps)
 
     intervention_summary = None
+    fold_summary = None
     if config.intervention_eval:
         intervention_summary = evaluate_torch_householder_intervention(
             base_model,
@@ -1161,6 +1294,25 @@ def run_torch_variant(
                 intervention_summary["disabled_eval_loss"],
                 intervention_summary["disabled_minus_active_eval_loss"],
             )
+        fold_summary = evaluate_torch_householder_fold_absorption(
+            base_model,
+            splits["validation"],
+            variant=variant,
+            batch_size=config.eval_batch_size,
+            eval_batches=config.eval_batches,
+            seed=config.seed,
+            device=device,
+            use_bf16=use_bf16,
+        )
+        if fold_summary is not None:
+            LOGGER.info(
+                "%s | fold_into_qk | active_eval_loss=%.4f | folded_eval_loss=%.4f | delta=%+.4f | probe_logit_max_abs=%.2e",
+                variant.label,
+                fold_summary["active_eval_loss"],
+                fold_summary["folded_eval_loss"],
+                fold_summary["folded_minus_active_eval_loss"],
+                fold_summary["folded_probe_logit_max_abs"],
+            )
 
     write_history_csv(history, history_csv_path)
     return summarize_variant_result(
@@ -1172,6 +1324,7 @@ def run_torch_variant(
         history_jsonl_path=history_jsonl_path,
         history_csv_path=history_csv_path,
         intervention_summary=intervention_summary,
+        fold_summary=fold_summary,
     )
 
 
@@ -1596,6 +1749,12 @@ def write_summary_csv(results: list[dict[str, Any]], path: Path) -> None:
         "intervention_disable_hh_eval_loss",
         "intervention_disable_hh_eval_delta",
         "intervention_disable_hh_eval_delta_pct",
+        "fold_active_eval_loss",
+        "folded_eval_loss",
+        "folded_eval_delta",
+        "folded_eval_delta_pct",
+        "folded_probe_logit_max_abs",
+        "folded_probe_logit_rms",
         "latest_probe_loss",
         "latest_probe_logit_entropy",
         "latest_probe_confidence",
@@ -1625,6 +1784,12 @@ def write_summary_csv(results: list[dict[str, Any]], path: Path) -> None:
                 result["intervention_disable_hh_eval_loss"],
                 result["intervention_disable_hh_eval_delta"],
                 result["intervention_disable_hh_eval_delta_pct"],
+                result["fold_active_eval_loss"],
+                result["folded_eval_loss"],
+                result["folded_eval_delta"],
+                result["folded_eval_delta_pct"],
+                result["folded_probe_logit_max_abs"],
+                result["folded_probe_logit_rms"],
                 latest_probe_summary.get("probe_loss"),
                 latest_probe_summary.get("probe_logit_entropy"),
                 latest_probe_summary.get("probe_confidence"),
@@ -1642,12 +1807,16 @@ def print_summary(results: list[dict[str, Any]]) -> None:
     for result in results:
         latest_probe_summary = result.get("latest_probe_summary") or {}
         intervention_delta = result.get("intervention_disable_hh_eval_delta")
+        fold_delta = result.get("folded_eval_delta")
+        fold_logit = result.get("folded_probe_logit_max_abs")
         LOGGER.info(
-            "%s | backend=%s | final_eval_loss=%s | intervention_disable_hh_delta=%s | mean_step_ms=%.3f | tokens_per_second=%.1f | probe_entropy=%s | rope_orth=%s",
+            "%s | backend=%s | final_eval_loss=%s | intervention_disable_hh_delta=%s | fold_eval_delta=%s | fold_logit_max_abs=%s | mean_step_ms=%.3f | tokens_per_second=%.1f | probe_entropy=%s | rope_orth=%s",
             result["variant"],
             result["backend"],
             "n/a" if result["final_eval_loss"] is None else f"{result['final_eval_loss']:.4f}",
             "n/a" if intervention_delta is None else f"{intervention_delta:+.4f}",
+            "n/a" if fold_delta is None else f"{fold_delta:+.4f}",
+            "n/a" if fold_logit is None else f"{fold_logit:.2e}",
             result["mean_step_ms"],
             result["mean_tokens_per_second"],
             "n/a"

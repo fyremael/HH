@@ -137,6 +137,26 @@ def test_evaluate_torch_householder_intervention_reports_disable_delta(
     assert summary["disabled_minus_active_eval_loss"] == pytest.approx(0.5)
 
 
+def test_fold_torch_householder_into_projections_preserves_logits() -> None:
+    torch.manual_seed(0)
+    model = MODULE.TorchHouseholderLM(
+        vocab_size=64,
+        embed_dim=32,
+        num_heads=4,
+        num_layers=2,
+        mlp_ratio=2.0,
+        variant=MODULE.RopeVariant(label="householder_m4", num_reflectors=4, init="jittered_pairs"),
+    )
+    input_ids = torch.randint(0, 64, (2, 12))
+    with torch.no_grad():
+        active_logits = model(input_ids)
+        with MODULE.fold_torch_householder_into_projections(model):
+            folded_logits = model(input_ids)
+        restored_logits = model(input_ids)
+    assert torch.allclose(active_logits, folded_logits, atol=1.0e-5)
+    assert torch.allclose(active_logits, restored_logits, atol=1.0e-6)
+
+
 def test_reduce_rope_diagnostics_summarizes_nested_metrics() -> None:
     reduced = MODULE.reduce_rope_diagnostics(
         {
