@@ -11,7 +11,7 @@ import random
 import statistics
 import sys
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -73,6 +73,7 @@ class RealDataHarnessConfig:
     seed: int
     use_compile: bool
     use_bf16: bool
+    intervention_eval: bool
     householder_init: str
     reflector_sweep: tuple[int, ...]
     output_dir: Path
@@ -196,6 +197,12 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Enable bf16 autocast or bf16 params when the backend supports it.",
+    )
+    parser.add_argument(
+        "--intervention-eval",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="After training HH variants, re-evaluate with HH disabled to measure causal impact.",
     )
     parser.add_argument(
         "--householder-init",
@@ -646,6 +653,7 @@ def summarize_variant_result(
     peak_memory_gb: float | None,
     history_jsonl_path: Path,
     history_csv_path: Path,
+    intervention_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     eval_history = [entry["eval_loss"] for entry in history if "eval_loss" in entry]
     latest_probe = latest_diagnostics(history)
@@ -663,6 +671,19 @@ def summarize_variant_result(
         "mean_parameter_global_norm": mean_from_history(history, "parameter_global_norm"),
         "peak_memory_gb": peak_memory_gb,
         "latest_probe_summary": None if latest_probe is None else latest_probe.get("summary"),
+        "intervention_summary": intervention_summary,
+        "intervention_active_eval_loss": None
+        if intervention_summary is None
+        else intervention_summary.get("active_eval_loss"),
+        "intervention_disable_hh_eval_loss": None
+        if intervention_summary is None
+        else intervention_summary.get("disabled_eval_loss"),
+        "intervention_disable_hh_eval_delta": None
+        if intervention_summary is None
+        else intervention_summary.get("disabled_minus_active_eval_loss"),
+        "intervention_disable_hh_eval_delta_pct": None
+        if intervention_summary is None
+        else intervention_summary.get("disabled_minus_active_eval_loss_pct"),
         "history_jsonl_path": str(history_jsonl_path),
         "history_csv_path": str(history_csv_path),
         "history": history,
@@ -757,6 +778,25 @@ def count_torch_parameters(model: nn.Module) -> int:
     return sum(parameter.numel() for parameter in model.parameters())
 
 
+def iter_torch_householder_ropes(model: nn.Module) -> Iterator[HouseholderRoPE]:
+    for module in model.modules():
+        if isinstance(module, HouseholderRoPE):
+            yield module
+
+
+@contextmanager
+def override_torch_householder_enabled(model: nn.Module, enabled: bool) -> Iterator[None]:
+    ropes = list(iter_torch_householder_ropes(model))
+    previous_states = [rope.config.enabled for rope in ropes]
+    for rope in ropes:
+        rope.config.enabled = enabled
+    try:
+        yield
+    finally:
+        for rope, previous_state in zip(ropes, previous_states):
+            rope.config.enabled = previous_state
+
+
 def evaluate_torch(
     model: nn.Module,
     split,
@@ -789,6 +829,49 @@ def evaluate_torch(
         raise ValueError("Validation loop produced no batches. Lower eval_batch_size or use a longer split.")
     model.train(training_state)
     return float(np.mean(losses))
+
+
+def evaluate_torch_householder_intervention(
+    model: nn.Module,
+    split,
+    *,
+    variant: RopeVariant,
+    batch_size: int,
+    eval_batches: int | None,
+    seed: int,
+    device: torch.device,
+    use_bf16: bool,
+) -> dict[str, float | str] | None:
+    if variant.num_reflectors == 0:
+        return None
+
+    active_eval_loss = evaluate_torch(
+        model,
+        split,
+        batch_size=batch_size,
+        eval_batches=eval_batches,
+        seed=seed,
+        device=device,
+        use_bf16=use_bf16,
+    )
+    with override_torch_householder_enabled(model, False):
+        disabled_eval_loss = evaluate_torch(
+            model,
+            split,
+            batch_size=batch_size,
+            eval_batches=eval_batches,
+            seed=seed,
+            device=device,
+            use_bf16=use_bf16,
+        )
+    delta = disabled_eval_loss - active_eval_loss
+    return {
+        "kind": "disable_hh",
+        "active_eval_loss": active_eval_loss,
+        "disabled_eval_loss": disabled_eval_loss,
+        "disabled_minus_active_eval_loss": delta,
+        "disabled_minus_active_eval_loss_pct": delta / active_eval_loss if active_eval_loss != 0.0 else 0.0,
+    }
 
 
 def collect_torch_probe_metrics(
@@ -1058,6 +1141,27 @@ def run_torch_variant(
         if should_log_record(config, record):
             log_training_record(variant.label, record, config.train_steps)
 
+    intervention_summary = None
+    if config.intervention_eval:
+        intervention_summary = evaluate_torch_householder_intervention(
+            base_model,
+            splits["validation"],
+            variant=variant,
+            batch_size=config.eval_batch_size,
+            eval_batches=config.eval_batches,
+            seed=config.seed,
+            device=device,
+            use_bf16=use_bf16,
+        )
+        if intervention_summary is not None:
+            LOGGER.info(
+                "%s | intervention disable_hh | active_eval_loss=%.4f | disabled_eval_loss=%.4f | delta=%+.4f",
+                variant.label,
+                intervention_summary["active_eval_loss"],
+                intervention_summary["disabled_eval_loss"],
+                intervention_summary["disabled_minus_active_eval_loss"],
+            )
+
     write_history_csv(history, history_csv_path)
     return summarize_variant_result(
         backend="torch",
@@ -1067,6 +1171,7 @@ def run_torch_variant(
         peak_memory_gb=float(torch.cuda.max_memory_allocated(device) / (1024**3)) if device.type == "cuda" else None,
         history_jsonl_path=history_jsonl_path,
         history_csv_path=history_csv_path,
+        intervention_summary=intervention_summary,
     )
 
 
@@ -1389,6 +1494,7 @@ def plot_results(
     dynamics_path: Path,
     component_path: Path,
     rope_path: Path,
+    intervention_path: Path,
 ) -> None:
     plt = import_plot_runtime()
 
@@ -1453,6 +1559,24 @@ def plot_results(
         title="Householder-RoPE transport diagnostics",
     )
 
+    intervention_labels = []
+    intervention_values = []
+    for result in results:
+        value = result.get("intervention_disable_hh_eval_delta")
+        if value is None:
+            continue
+        intervention_labels.append(result["variant"])
+        intervention_values.append(value)
+    if intervention_labels:
+        plt.figure(figsize=(8, 4.5))
+        plt.axhline(0.0, color="black", linewidth=1.0, linestyle="--")
+        plt.bar(intervention_labels, intervention_values)
+        plt.ylabel("Disabled - active eval loss")
+        plt.title("HH intervention impact on full validation")
+        plt.tight_layout()
+        plt.savefig(intervention_path, dpi=160)
+        plt.close()
+
 
 def write_summary_csv(results: list[dict[str, Any]], path: Path) -> None:
     header = [
@@ -1468,6 +1592,10 @@ def write_summary_csv(results: list[dict[str, Any]], path: Path) -> None:
         "mean_grad_global_norm",
         "mean_parameter_global_norm",
         "peak_memory_gb",
+        "intervention_active_eval_loss",
+        "intervention_disable_hh_eval_loss",
+        "intervention_disable_hh_eval_delta",
+        "intervention_disable_hh_eval_delta_pct",
         "latest_probe_loss",
         "latest_probe_logit_entropy",
         "latest_probe_confidence",
@@ -1493,6 +1621,10 @@ def write_summary_csv(results: list[dict[str, Any]], path: Path) -> None:
                 result["mean_grad_global_norm"],
                 result["mean_parameter_global_norm"],
                 result["peak_memory_gb"],
+                result["intervention_active_eval_loss"],
+                result["intervention_disable_hh_eval_loss"],
+                result["intervention_disable_hh_eval_delta"],
+                result["intervention_disable_hh_eval_delta_pct"],
                 latest_probe_summary.get("probe_loss"),
                 latest_probe_summary.get("probe_logit_entropy"),
                 latest_probe_summary.get("probe_confidence"),
@@ -1509,11 +1641,13 @@ def write_summary_csv(results: list[dict[str, Any]], path: Path) -> None:
 def print_summary(results: list[dict[str, Any]]) -> None:
     for result in results:
         latest_probe_summary = result.get("latest_probe_summary") or {}
+        intervention_delta = result.get("intervention_disable_hh_eval_delta")
         LOGGER.info(
-            "%s | backend=%s | final_eval_loss=%s | mean_step_ms=%.3f | tokens_per_second=%.1f | probe_entropy=%s | rope_orth=%s",
+            "%s | backend=%s | final_eval_loss=%s | intervention_disable_hh_delta=%s | mean_step_ms=%.3f | tokens_per_second=%.1f | probe_entropy=%s | rope_orth=%s",
             result["variant"],
             result["backend"],
             "n/a" if result["final_eval_loss"] is None else f"{result['final_eval_loss']:.4f}",
+            "n/a" if intervention_delta is None else f"{intervention_delta:+.4f}",
             result["mean_step_ms"],
             result["mean_tokens_per_second"],
             "n/a"
@@ -1556,6 +1690,7 @@ def main() -> None:
         seed=args.seed,
         use_compile=args.use_compile,
         use_bf16=args.use_bf16,
+        intervention_eval=args.intervention_eval,
         householder_init=args.householder_init,
         reflector_sweep=tuple(args.reflector_sweep),
         output_dir=args.output_dir,
@@ -1615,6 +1750,7 @@ def main() -> None:
     dynamics_path = config.output_dir / f"{config.output_stem}_training_dynamics.png"
     component_path = config.output_dir / f"{config.output_stem}_component_diagnostics.png"
     rope_path = config.output_dir / f"{config.output_stem}_rope_diagnostics.png"
+    intervention_path = config.output_dir / f"{config.output_stem}_intervention_impact.png"
 
     payload = {
         "config": config.to_dict(),
@@ -1629,6 +1765,7 @@ def main() -> None:
             "training_dynamics": str(dynamics_path),
             "component_diagnostics": str(component_path),
             "rope_diagnostics": str(rope_path),
+            "intervention_impact": str(intervention_path),
         },
         "results": results,
     }
@@ -1641,6 +1778,7 @@ def main() -> None:
         dynamics_path=dynamics_path,
         component_path=component_path,
         rope_path=rope_path,
+        intervention_path=intervention_path,
     )
     print_summary(results)
 
@@ -1651,6 +1789,8 @@ def main() -> None:
     LOGGER.info("Wrote training dynamics plot to %s", dynamics_path)
     LOGGER.info("Wrote component diagnostics plot to %s", component_path)
     LOGGER.info("Wrote RoPE diagnostics plot to %s", rope_path)
+    if any(result.get("intervention_disable_hh_eval_delta") is not None for result in results):
+        LOGGER.info("Wrote intervention impact plot to %s", intervention_path)
 
 
 if __name__ == "__main__":

@@ -30,6 +30,8 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "all the way down to 1" in intro
     assert "gradient accumulation" in intro
     assert "full validation sweeps" in intro
+    assert "re-evaluates HH variants with HH disabled" in intro
+    assert "intervention deltas" in intro
 
     joined_sources = "\n".join(cell["source"] for cell in cells)
     assert 'run_command("git", "clone"' in joined_sources
@@ -56,6 +58,7 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert '"embed_dim": 1536' in joined_sources
     assert '"num_heads": 24' in joined_sources
     assert '"reflector_sweep": [0, 16, 32]' in joined_sources
+    assert '"intervention_eval": True' in joined_sources
     assert "log_every" in joined_sources
     assert "diagnostics_every" in joined_sources
     assert "diagnostic_token_limit" in joined_sources
@@ -70,6 +73,8 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert '"INFO"' in joined_sources
     assert "append_optional_flag" in joined_sources
     assert 'serialized = "full" if value is None else str(value)' in joined_sources
+    assert '"--intervention-eval"' in joined_sources
+    assert '"--no-intervention-eval"' in joined_sources
     assert "Live harness logs will stream below." in joined_sources
     assert "subprocess.Popen(" in joined_sources
     assert "stdout=subprocess.PIPE" in joined_sources
@@ -93,7 +98,10 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "Effective tokens per optimizer step:" in joined_sources
     assert "Evaluation mode:" in joined_sources
     assert "full validation" in joined_sources
+    assert "Intervention eval:" in joined_sources
     assert "mean_tokens_per_second" in joined_sources
     assert "peak_memory_gb" in joined_sources
+    assert "intervention_disable_hh_eval_delta" in joined_sources
     assert "eval_loss_delta_vs_standard" in joined_sources
     assert "throughput_ratio_vs_standard" in joined_sources
+    assert "intervention_impact.png" in joined_sources

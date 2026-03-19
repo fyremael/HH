@@ -60,6 +60,7 @@ def test_config_to_dict_serializes_output_dir() -> None:
         seed=0,
         use_compile=False,
         use_bf16=False,
+        intervention_eval=True,
         householder_init="jittered_pairs",
         reflector_sweep=(0, 8),
         output_dir=output_dir,
@@ -71,6 +72,7 @@ def test_config_to_dict_serializes_output_dir() -> None:
     assert payload["diagnostics_every"] == 1
     assert payload["train_text_limit"] is None
     assert payload["eval_batches"] is None
+    assert payload["intervention_eval"] is True
 
 
 def test_parse_optional_record_limit_accepts_full_keywords() -> None:
@@ -83,6 +85,56 @@ def test_parse_optional_eval_batches_accepts_full_keywords_and_zero() -> None:
     assert MODULE.parse_optional_eval_batches("full") is None
     assert MODULE.parse_optional_eval_batches("0") is None
     assert MODULE.parse_optional_eval_batches("7") == 7
+
+
+def test_override_torch_householder_enabled_restores_state() -> None:
+    model = MODULE.TorchHouseholderLM(
+        vocab_size=64,
+        embed_dim=32,
+        num_heads=4,
+        num_layers=2,
+        mlp_ratio=2.0,
+        variant=MODULE.RopeVariant(label="householder_m4", num_reflectors=4, init="jittered_pairs"),
+    )
+    ropes = list(MODULE.iter_torch_householder_ropes(model))
+    assert ropes
+    assert all(rope.config.enabled for rope in ropes)
+    with MODULE.override_torch_householder_enabled(model, False):
+        assert all(not rope.config.enabled for rope in ropes)
+    assert all(rope.config.enabled for rope in ropes)
+
+
+def test_evaluate_torch_householder_intervention_reports_disable_delta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = MODULE.TorchHouseholderLM(
+        vocab_size=64,
+        embed_dim=32,
+        num_heads=4,
+        num_layers=1,
+        mlp_ratio=2.0,
+        variant=MODULE.RopeVariant(label="householder_m4", num_reflectors=4, init="jittered_pairs"),
+    )
+
+    def fake_evaluate_torch(*args, **kwargs):
+        ropes = list(MODULE.iter_torch_householder_ropes(model))
+        return 4.0 if all(rope.config.enabled for rope in ropes) else 4.5
+
+    monkeypatch.setattr(MODULE, "evaluate_torch", fake_evaluate_torch)
+    summary = MODULE.evaluate_torch_householder_intervention(
+        model,
+        split=[],
+        variant=MODULE.RopeVariant(label="householder_m4", num_reflectors=4, init="jittered_pairs"),
+        batch_size=2,
+        eval_batches=None,
+        seed=0,
+        device=torch.device("cpu"),
+        use_bf16=False,
+    )
+    assert summary is not None
+    assert summary["active_eval_loss"] == pytest.approx(4.0)
+    assert summary["disabled_eval_loss"] == pytest.approx(4.5)
+    assert summary["disabled_minus_active_eval_loss"] == pytest.approx(0.5)
 
 
 def test_reduce_rope_diagnostics_summarizes_nested_metrics() -> None:
