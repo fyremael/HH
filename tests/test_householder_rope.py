@@ -138,6 +138,44 @@ def test_paired_identity_initialization_is_exact_identity() -> None:
     assert torch.allclose(Q, identity, atol=1.0e-6)
 
 
+def test_frequency_banded_reflectors_have_local_support_and_keep_identity_init_exact() -> None:
+    torch.manual_seed(8)
+    config = HouseholderRoPEConfig(
+        mode="shared",
+        num_reflectors=4,
+        init="paired_identity",
+        rope_ndim=1,
+        mixing_strategy="frequency_banded",
+        local_band_pairs=2,
+    )
+    rope = HouseholderRoPE(
+        num_heads=2,
+        head_dim=16,
+        config=config,
+        rope_core=BlockDiagonalRoPECore(dim=16, ndim=1),
+    )
+    identity = torch.eye(16, dtype=torch.float64)
+    assert torch.allclose(rope.materialize_Q().to(torch.float64), identity, atol=1.0e-6)
+
+    random_config = HouseholderRoPEConfig(
+        mode="shared",
+        num_reflectors=4,
+        init="random",
+        rope_ndim=1,
+        mixing_strategy="frequency_banded",
+        local_band_pairs=2,
+    )
+    random_rope = HouseholderRoPE(
+        num_heads=2,
+        head_dim=16,
+        config=random_config,
+        rope_core=BlockDiagonalRoPECore(dim=16, ndim=1),
+    )
+    effective = random_rope.effective_reflectors(detach=True)
+    support_counts = effective.ne(0.0).sum(dim=-1)
+    assert torch.all(support_counts <= 4)
+
+
 def test_dense_and_matrix_free_attention_logits_match() -> None:
     torch.manual_seed(9)
     config = HouseholderRoPEConfig(

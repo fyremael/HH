@@ -62,6 +62,9 @@ def test_config_to_dict_serializes_output_dir() -> None:
         use_bf16=False,
         intervention_eval=True,
         householder_init="jittered_pairs",
+        householder_mixing_sweep=("global",),
+        householder_local_band_pairs=2,
+        freeze_qk_after_warmup_steps=None,
         reflector_sweep=(0, 8),
         output_dir=output_dir,
         output_stem="smoke",
@@ -73,6 +76,9 @@ def test_config_to_dict_serializes_output_dir() -> None:
     assert payload["train_text_limit"] is None
     assert payload["eval_batches"] is None
     assert payload["intervention_eval"] is True
+    assert payload["householder_mixing_sweep"] == ("global",)
+    assert payload["householder_local_band_pairs"] == 2
+    assert payload["freeze_qk_after_warmup_steps"] is None
 
 
 def test_parse_optional_record_limit_accepts_full_keywords() -> None:
@@ -85,6 +91,12 @@ def test_parse_optional_eval_batches_accepts_full_keywords_and_zero() -> None:
     assert MODULE.parse_optional_eval_batches("full") is None
     assert MODULE.parse_optional_eval_batches("0") is None
     assert MODULE.parse_optional_eval_batches("7") == 7
+
+
+def test_parse_optional_nonnegative_int_accepts_none_keyword() -> None:
+    assert MODULE.parse_optional_nonnegative_int("none") is None
+    assert MODULE.parse_optional_nonnegative_int("0") == 0
+    assert MODULE.parse_optional_nonnegative_int("9") == 9
 
 
 def test_override_torch_householder_enabled_restores_state() -> None:
@@ -135,6 +147,39 @@ def test_evaluate_torch_householder_intervention_reports_disable_delta(
     assert summary["active_eval_loss"] == pytest.approx(4.0)
     assert summary["disabled_eval_loss"] == pytest.approx(4.5)
     assert summary["disabled_minus_active_eval_loss"] == pytest.approx(0.5)
+
+
+def test_build_variants_supports_frequency_banded_labels() -> None:
+    variants = MODULE.build_variants(
+        (0, 8),
+        "jittered_pairs",
+        householder_mixing_sweep=("global", "frequency_banded"),
+        householder_local_band_pairs=3,
+    )
+    assert [variant.label for variant in variants] == [
+        "standard_rope",
+        "householder_m8",
+        "householder_local_p3_m8",
+    ]
+    assert variants[-1].mixing_strategy == "frequency_banded"
+    assert variants[-1].local_band_pairs == 3
+
+
+def test_set_torch_qk_projection_trainable_disables_qk_updates() -> None:
+    model = MODULE.TorchHouseholderLM(
+        vocab_size=64,
+        embed_dim=32,
+        num_heads=4,
+        num_layers=1,
+        mlp_ratio=2.0,
+        variant=MODULE.RopeVariant(label="householder_m4", num_reflectors=4, init="jittered_pairs"),
+    )
+    parameters = list(MODULE.iter_torch_qk_projection_parameters(model))
+    assert parameters
+    assert all(parameter.requires_grad for parameter in parameters)
+    MODULE.set_torch_qk_projection_trainable(model, False)
+    assert all(not parameter.requires_grad for parameter in parameters)
+    assert MODULE.count_trainable_parameters(iter(parameters)) == 0
 
 
 def test_fold_torch_householder_into_projections_preserves_logits() -> None:

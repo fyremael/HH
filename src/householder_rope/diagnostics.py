@@ -92,6 +92,7 @@ def reflector_utilization(
 ) -> dict[str, Tensor]:
     summary: dict[str, Tensor] = {
         "raw_norms": torch.linalg.vector_norm(V, dim=-1),
+        "support_fraction": V.ne(0.0).float().mean(dim=-1),
     }
     if V.shape[-2] >= 2:
         pair_count = V.shape[-2] // 2
@@ -149,8 +150,12 @@ def summarize_householder_rope_diagnostics(
     summary["commutator_defect"] = commutator_defect(rope.rope_core, Q)
     summary["block_mixing_energy"] = block_mixing_energy(Q)
     summary["reflector_utilization"] = reflector_utilization(
-        rope.reflectors.detach(),
-        grad=None if rope.reflectors.grad is None else rope.reflectors.grad.detach(),
+        rope.effective_reflectors(detach=True),
+        grad=(
+            None
+            if rope.reflectors.grad is None
+            else rope.reflectors.grad.detach() * rope.reflector_support_mask.to(rope.reflectors.grad)
+        ),
         eps=rope.config.eps,
     )
     if q is not None and k is not None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -420,6 +421,8 @@ class HouseholderRoPEConfig:
     eps: float = 1.0e-8
     rope_ndim: int = 1
     base: float = 10000.0
+    mixing_strategy: Literal["global", "frequency_banded"] = "global"
+    local_band_pairs: int = 2
     materialize_q_for_debug: bool = False
     group_size: int = 2
     use_tau_parameterization: bool = False
@@ -457,6 +460,10 @@ class HouseholderRoPEConfig:
             )
         if self.rope_ndim < 1:
             raise ValueError(f"rope_ndim must be positive, received {self.rope_ndim}.")
+        if self.mixing_strategy not in {"global", "frequency_banded"}:
+            raise ValueError(f"Unsupported mixing_strategy '{self.mixing_strategy}'.")
+        if self.local_band_pairs < 1:
+            raise ValueError(f"local_band_pairs must be positive, received {self.local_band_pairs}.")
 
     def num_banks(self, num_heads: int) -> int:
         if self.mode == "shared":
@@ -508,6 +515,11 @@ class HouseholderRoPE(nn.Module):
             else (self.config.num_banks(num_heads), self.config.num_reflectors, head_dim)
         )
         self.reflectors = nn.Parameter(torch.empty(reflector_shape, dtype=torch.float32))
+        self.register_buffer(
+            "reflector_support_mask",
+            self._build_reflector_support_mask(reflector_shape),
+            persistent=False,
+        )
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -529,14 +541,45 @@ class HouseholderRoPE(nn.Module):
             if self.config.init == "jittered_pairs":
                 paired[..., 1::2, :] += 1.0e-2 * torch.randn_like(paired[..., 1::2, :])
             self.reflectors.copy_(paired)
+            self.reflectors.mul_(self.reflector_support_mask.to(dtype=self.reflectors.dtype))
+
+    def _build_reflector_support_mask(self, reflector_shape: tuple[int, ...]) -> Tensor:
+        mask = torch.ones(reflector_shape, dtype=torch.float32)
+        if self.config.mixing_strategy == "global" or self.config.num_reflectors == 0:
+            return mask
+
+        mask.zero_()
+        num_pairs = self.head_dim // 2
+        band_pairs = min(self.config.local_band_pairs, num_pairs)
+        band_count = max(1, math.ceil(num_pairs / band_pairs))
+        support_slot_count = max(1, math.ceil(self.config.num_reflectors / 2))
+
+        for reflector_index in range(self.config.num_reflectors):
+            support_slot = reflector_index // 2
+            band_index = min((support_slot * band_count) // support_slot_count, band_count - 1)
+            pair_start = band_index * band_pairs
+            pair_stop = min(num_pairs, pair_start + band_pairs)
+            dim_start = 2 * pair_start
+            dim_stop = 2 * pair_stop
+            if mask.dim() == 2:
+                mask[reflector_index, dim_start:dim_stop] = 1.0
+            else:
+                mask[:, reflector_index, dim_start:dim_stop] = 1.0
+        return mask
+
+    def effective_reflectors(self, *, detach: bool = False) -> Tensor:
+        reflectors = self.reflectors.detach() if detach else self.reflectors
+        mask = self.reflector_support_mask.to(device=reflectors.device, dtype=reflectors.dtype)
+        return reflectors * mask
 
     def premix_qk(self, q: Tensor, k: Tensor) -> tuple[Tensor, Tensor]:
         if not self.config.enabled:
             return q, k
+        reflectors = self.effective_reflectors()
         return premix_qk(
             q,
             k,
-            self.reflectors,
+            reflectors,
             eps=self.config.eps,
             head_to_group=None if self.config.mode == "per_head" else self.head_to_bank,
             fp32_norm_accumulation=self.config.fp32_norm_accumulation,
@@ -551,12 +594,13 @@ class HouseholderRoPE(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         if not self.config.enabled:
             return self.rope_core(q, k, pos)
+        reflectors = self.effective_reflectors()
         return apply_householder_rope(
             q,
             k,
             pos,
             self.rope_core,
-            self.reflectors,
+            reflectors,
             eps=self.config.eps,
             head_to_group=None if self.config.mode == "per_head" else self.head_to_bank,
             fp32_norm_accumulation=self.config.fp32_norm_accumulation,
@@ -564,7 +608,7 @@ class HouseholderRoPE(nn.Module):
         )
 
     def materialize_Q(self, *, expand_heads: bool = False) -> Tensor:
-        Q = materialize_Q(self.reflectors, eps=self.config.eps)
+        Q = materialize_Q(self.effective_reflectors(detach=True), eps=self.config.eps)
         if not expand_heads:
             return Q
         if Q.dim() == 2:

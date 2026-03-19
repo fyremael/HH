@@ -14,7 +14,7 @@ import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 
 import numpy as np
 import torch
@@ -42,6 +42,8 @@ class RopeVariant:
     label: str
     num_reflectors: int
     init: str
+    mixing_strategy: Literal["global", "frequency_banded"] = "global"
+    local_band_pairs: int = 2
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,9 @@ class RealDataHarnessConfig:
     use_bf16: bool
     intervention_eval: bool
     householder_init: str
+    householder_mixing_sweep: tuple[str, ...]
+    householder_local_band_pairs: int
+    freeze_qk_after_warmup_steps: int | None
     reflector_sweep: tuple[int, ...]
     output_dir: Path
     output_stem: str
@@ -108,6 +113,18 @@ def parse_optional_eval_batches(value: str) -> int | None:
         return None
     if parsed < 0:
         raise argparse.ArgumentTypeError("Expected a non-negative integer or one of: all, full, none.")
+    return parsed
+
+
+def parse_optional_nonnegative_int(value: str) -> int | None:
+    """Parse a non-negative integer or a disable sentinel."""
+
+    normalized = value.strip().lower()
+    if normalized in {"none", "off", "disable", "disabled"}:
+        return None
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("Expected a non-negative integer or one of: none, off, disable.")
     return parsed
 
 
@@ -211,6 +228,25 @@ def parse_args() -> argparse.Namespace:
         help="Initialization for non-zero reflector variants.",
     )
     parser.add_argument(
+        "--householder-mixing-sweep",
+        nargs="+",
+        default=["global"],
+        choices=["global", "frequency_banded"],
+        help="Householder transport families to benchmark for non-zero reflector variants.",
+    )
+    parser.add_argument(
+        "--householder-local-band-pairs",
+        type=int,
+        default=2,
+        help="How many RoPE 2D frequency pairs each local HH band may mix when using frequency_banded transport.",
+    )
+    parser.add_argument(
+        "--freeze-qk-after-warmup-steps",
+        type=parse_optional_nonnegative_int,
+        default=None,
+        help="Freeze q_proj and k_proj after this many optimizer steps. Use 0 to freeze immediately.",
+    )
+    parser.add_argument(
         "--reflector-sweep",
         type=int,
         nargs="+",
@@ -259,10 +295,13 @@ def should_log_record(config: RealDataHarnessConfig, record: dict[str, Any]) -> 
 
 def log_variant_start(config: RealDataHarnessConfig, variant: RopeVariant, *, backend: str) -> None:
     LOGGER.info(
-        "Starting %s | backend=%s | reflectors=%d | steps=%d | batch=%d | seq_len=%d | log_every=%d | diagnostics_every=%d",
+        "Starting %s | backend=%s | reflectors=%d | mixing=%s | local_band_pairs=%d | freeze_qk_after=%s | steps=%d | batch=%d | seq_len=%d | log_every=%d | diagnostics_every=%d",
         variant.label,
         backend,
         variant.num_reflectors,
+        variant.mixing_strategy,
+        variant.local_band_pairs,
+        "off" if config.freeze_qk_after_warmup_steps is None else str(config.freeze_qk_after_warmup_steps),
         config.train_steps,
         config.batch_size,
         config.seq_len,
@@ -352,25 +391,42 @@ def collect_environment(backend: str) -> dict[str, Any]:
     return environment
 
 
-def build_variants(reflector_sweep: tuple[int, ...], householder_init: str) -> list[RopeVariant]:
+def build_variants(
+    reflector_sweep: tuple[int, ...],
+    householder_init: str,
+    *,
+    householder_mixing_sweep: tuple[str, ...] = ("global",),
+    householder_local_band_pairs: int = 2,
+) -> list[RopeVariant]:
     variants: list[RopeVariant] = []
-    seen_counts: set[int] = set()
+    seen_variants: set[tuple[int, str]] = set()
     for count in reflector_sweep:
         if count < 0:
             raise ValueError(f"Reflector counts must be non-negative, received {count}.")
-        if count in seen_counts:
-            continue
-        seen_counts.add(count)
         if count == 0:
+            if (0, "global") in seen_variants:
+                continue
+            seen_variants.add((0, "global"))
             variants.append(RopeVariant(label="standard_rope", num_reflectors=0, init="paired_identity"))
         else:
-            variants.append(
-                RopeVariant(
-                    label=f"householder_m{count}",
-                    num_reflectors=count,
-                    init=householder_init,
+            for mixing_strategy in householder_mixing_sweep:
+                key = (count, mixing_strategy)
+                if key in seen_variants:
+                    continue
+                seen_variants.add(key)
+                if mixing_strategy == "global":
+                    label = f"householder_m{count}"
+                else:
+                    label = f"householder_local_p{householder_local_band_pairs}_m{count}"
+                variants.append(
+                    RopeVariant(
+                        label=label,
+                        num_reflectors=count,
+                        init=householder_init,
+                        mixing_strategy=mixing_strategy,
+                        local_band_pairs=householder_local_band_pairs,
+                    )
                 )
-            )
     return variants
 
 
@@ -563,6 +619,7 @@ def reduce_rope_diagnostics(summary: dict[str, Any]) -> dict[str, float]:
         "identity_deviation": "identity_deviation",
         "orthogonality_defect": "utilization_orthogonality_defect",
         "gradient_norms": "reflector_gradient_norm",
+        "support_fraction": "reflector_support_fraction",
     }
     for key, prefix in field_map.items():
         if key not in utilization:
@@ -662,6 +719,8 @@ def summarize_variant_result(
         "backend": backend,
         "variant": variant.label,
         "num_reflectors": variant.num_reflectors,
+        "mixing_strategy": variant.mixing_strategy,
+        "local_band_pairs": variant.local_band_pairs,
         "parameter_count": parameter_count,
         "final_train_loss": history[-1]["train_loss"],
         "final_train_perplexity": history[-1].get("train_perplexity"),
@@ -670,6 +729,7 @@ def summarize_variant_result(
         "mean_tokens_per_second": float(statistics.mean(entry["tokens_per_second"] for entry in history)),
         "mean_grad_global_norm": mean_from_history(history, "grad_global_norm"),
         "mean_parameter_global_norm": mean_from_history(history, "parameter_global_norm"),
+        "freeze_qk_after_warmup_steps": last_from_history(history, "freeze_qk_after_warmup_steps"),
         "peak_memory_gb": peak_memory_gb,
         "latest_probe_summary": None if latest_probe is None else latest_probe.get("summary"),
         "intervention_summary": intervention_summary,
@@ -730,6 +790,8 @@ class TorchTransformerBlock(nn.Module):
                 init=variant.init,
                 rope_ndim=1,
                 enforce_SO=variant.num_reflectors % 2 == 0,
+                mixing_strategy=variant.mixing_strategy,
+                local_band_pairs=variant.local_band_pairs,
             ),
             rope_core=BlockDiagonalRoPECore(dim=head_dim, ndim=1),
         )
@@ -796,6 +858,32 @@ def iter_torch_householder_attentions(model: nn.Module) -> Iterator[HouseholderS
     for module in model.modules():
         if isinstance(module, HouseholderSelfAttention) and isinstance(module.rope, HouseholderRoPE):
             yield module
+
+
+def iter_torch_qk_projection_parameters(model: nn.Module) -> Iterator[torch.Tensor]:
+    for attention in iter_torch_householder_attentions(model):
+        yield attention.q_proj.weight
+        if attention.q_proj.bias is not None:
+            yield attention.q_proj.bias
+        yield attention.k_proj.weight
+        if attention.k_proj.bias is not None:
+            yield attention.k_proj.bias
+
+
+def iter_torch_reflector_parameters(model: nn.Module) -> Iterator[torch.Tensor]:
+    for rope in iter_torch_householder_ropes(model):
+        yield rope.reflectors
+
+
+def set_torch_qk_projection_trainable(model: nn.Module, trainable: bool) -> None:
+    for parameter in iter_torch_qk_projection_parameters(model):
+        parameter.requires_grad_(trainable)
+        if not trainable:
+            parameter.grad = None
+
+
+def count_trainable_parameters(parameters: Iterator[torch.Tensor]) -> int:
+    return sum(parameter.numel() for parameter in parameters if parameter.requires_grad)
 
 
 @contextmanager
@@ -1130,6 +1218,7 @@ def collect_torch_probe_metrics(
         "rope_identity_deviation_mean",
         "rope_pair_cosine_similarity_mean",
         "rope_raw_reflector_norm_mean",
+        "rope_reflector_support_fraction_mean",
         "rope_reflector_gradient_norm_mean",
     ):
         value = layer_mean(key)
@@ -1154,8 +1243,10 @@ def log_training_record(variant_label: str, record: dict[str, Any], train_steps:
     if "memory_allocated_gb" in record:
         peak = record.get("peak_memory_gb", record["memory_allocated_gb"])
         memory = f"{record['memory_allocated_gb']:.2f}/{peak:.2f}GB"
+    qk_grad = "n/a" if "qk_grad_global_norm" not in record else f"{record['qk_grad_global_norm']:.4f}"
+    qk_state = "frozen" if record.get("qk_frozen", False) else "trainable"
     LOGGER.info(
-        "%s | step %d/%d | train_loss=%.4f | train_ppl=%.2f | eval_loss=%s | grad_norm=%.4f | tok/s=%.1f | mem=%s | probe_entropy=%s | rope_orth=%s | rope_id=%s",
+        "%s | step %d/%d | train_loss=%.4f | train_ppl=%.2f | eval_loss=%s | grad_norm=%.4f | qk_grad=%s | qk=%s | tok/s=%.1f | mem=%s | probe_entropy=%s | rope_orth=%s | rope_id=%s",
         variant_label,
         record["step"],
         train_steps,
@@ -1163,6 +1254,8 @@ def log_training_record(variant_label: str, record: dict[str, Any], train_steps:
         record["train_perplexity"],
         eval_loss,
         record["grad_global_norm"],
+        qk_grad,
+        qk_state,
         record["tokens_per_second"],
         memory,
         probe_entropy,
@@ -1189,7 +1282,14 @@ def run_torch_variant(
     ).to(device)
     parameter_count = count_torch_parameters(base_model)
     train_model: nn.Module = base_model
-    if config.use_compile and hasattr(torch, "compile") and device.type == "cuda":
+    compile_enabled = config.use_compile
+    if compile_enabled and config.freeze_qk_after_warmup_steps is not None:
+        LOGGER.info(
+            "%s | disabling torch.compile because q/k freezing changes the trainable parameter set after warmup.",
+            variant.label,
+        )
+        compile_enabled = False
+    if compile_enabled and hasattr(torch, "compile") and device.type == "cuda":
         train_model = torch.compile(base_model)
     optimizer = torch.optim.AdamW(base_model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     train_iter = batch_iterator(splits["train"], config.batch_size, shuffle=True, seed=config.seed)
@@ -1207,8 +1307,25 @@ def run_torch_variant(
 
     log_variant_start(config, variant, backend="torch")
     log_variant_paths(variant, history_jsonl_path=history_jsonl_path, history_csv_path=history_csv_path)
+    qk_frozen = False
+    if config.freeze_qk_after_warmup_steps == 0:
+        set_torch_qk_projection_trainable(base_model, False)
+        qk_frozen = True
+        LOGGER.info("%s | froze q_proj/k_proj before the first optimizer step.", variant.label)
 
     for step in range(1, config.train_steps + 1):
+        if (
+            not qk_frozen
+            and config.freeze_qk_after_warmup_steps is not None
+            and step == config.freeze_qk_after_warmup_steps + 1
+        ):
+            set_torch_qk_projection_trainable(base_model, False)
+            qk_frozen = True
+            LOGGER.info(
+                "%s | froze q_proj/k_proj after warmup step %d.",
+                variant.label,
+                config.freeze_qk_after_warmup_steps,
+            )
         train_model.train()
         step_start = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
@@ -1243,6 +1360,11 @@ def run_torch_variant(
             "tokens_per_second": tokens_per_step / max(step_ms / 1000.0, 1.0e-9),
             "grad_global_norm": grad_norm,
             "parameter_global_norm": parameter_global_norm(base_model.parameters()),
+            "qk_grad_global_norm": gradient_global_norm(iter_torch_qk_projection_parameters(base_model)),
+            "reflector_grad_global_norm": gradient_global_norm(iter_torch_reflector_parameters(base_model)),
+            "qk_trainable_parameter_count": count_trainable_parameters(iter_torch_qk_projection_parameters(base_model)),
+            "qk_frozen": qk_frozen,
+            "freeze_qk_after_warmup_steps": config.freeze_qk_after_warmup_steps,
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
         }
         if device.type == "cuda":
@@ -1678,11 +1800,14 @@ def plot_results(
     plt.savefig(throughput_path, dpi=160)
     plt.close()
 
+    qk_dynamics_key = "qk_grad_global_norm" if any(history_series(result["history"], "qk_grad_global_norm")[1] for result in results) else "parameter_global_norm"
+    qk_dynamics_title = "q/k gradient norm" if qk_dynamics_key == "qk_grad_global_norm" else "Parameter norm"
+    qk_dynamics_ylabel = "L2 norm"
     plot_metric_grid(
         results,
         specs=[
             ("grad_global_norm", "Gradient norm", "L2 norm"),
-            ("parameter_global_norm", "Parameter norm", "L2 norm"),
+            (qk_dynamics_key, qk_dynamics_title, qk_dynamics_ylabel),
             ("probe_logit_entropy", "Probe logit entropy", "Entropy"),
             ("probe_confidence", "Probe confidence", "Probability"),
         ],
@@ -1736,6 +1861,8 @@ def write_summary_csv(results: list[dict[str, Any]], path: Path) -> None:
         "variant",
         "backend",
         "num_reflectors",
+        "mixing_strategy",
+        "local_band_pairs",
         "parameter_count",
         "final_train_loss",
         "final_train_perplexity",
@@ -1744,6 +1871,7 @@ def write_summary_csv(results: list[dict[str, Any]], path: Path) -> None:
         "mean_tokens_per_second",
         "mean_grad_global_norm",
         "mean_parameter_global_norm",
+        "freeze_qk_after_warmup_steps",
         "peak_memory_gb",
         "intervention_active_eval_loss",
         "intervention_disable_hh_eval_loss",
@@ -1771,6 +1899,8 @@ def write_summary_csv(results: list[dict[str, Any]], path: Path) -> None:
                 result["variant"],
                 result["backend"],
                 result["num_reflectors"],
+                result["mixing_strategy"],
+                result["local_band_pairs"],
                 result["parameter_count"],
                 result["final_train_loss"],
                 result["final_train_perplexity"],
@@ -1779,6 +1909,7 @@ def write_summary_csv(results: list[dict[str, Any]], path: Path) -> None:
                 result["mean_tokens_per_second"],
                 result["mean_grad_global_norm"],
                 result["mean_parameter_global_norm"],
+                result.get("freeze_qk_after_warmup_steps"),
                 result["peak_memory_gb"],
                 result["intervention_active_eval_loss"],
                 result["intervention_disable_hh_eval_loss"],
@@ -1810,9 +1941,14 @@ def print_summary(results: list[dict[str, Any]]) -> None:
         fold_delta = result.get("folded_eval_delta")
         fold_logit = result.get("folded_probe_logit_max_abs")
         LOGGER.info(
-            "%s | backend=%s | final_eval_loss=%s | intervention_disable_hh_delta=%s | fold_eval_delta=%s | fold_logit_max_abs=%s | mean_step_ms=%.3f | tokens_per_second=%.1f | probe_entropy=%s | rope_orth=%s",
+            "%s | backend=%s | mixing=%s | local_band_pairs=%d | freeze_qk_after=%s | final_eval_loss=%s | intervention_disable_hh_delta=%s | fold_eval_delta=%s | fold_logit_max_abs=%s | mean_step_ms=%.3f | tokens_per_second=%.1f | probe_entropy=%s | rope_orth=%s",
             result["variant"],
             result["backend"],
+            result["mixing_strategy"],
+            result["local_band_pairs"],
+            "off"
+            if result.get("freeze_qk_after_warmup_steps") is None
+            else str(result["freeze_qk_after_warmup_steps"]),
             "n/a" if result["final_eval_loss"] is None else f"{result['final_eval_loss']:.4f}",
             "n/a" if intervention_delta is None else f"{intervention_delta:+.4f}",
             "n/a" if fold_delta is None else f"{fold_delta:+.4f}",
@@ -1861,6 +1997,9 @@ def main() -> None:
         use_bf16=args.use_bf16,
         intervention_eval=args.intervention_eval,
         householder_init=args.householder_init,
+        householder_mixing_sweep=tuple(args.householder_mixing_sweep),
+        householder_local_band_pairs=args.householder_local_band_pairs,
+        freeze_qk_after_warmup_steps=args.freeze_qk_after_warmup_steps,
         reflector_sweep=tuple(args.reflector_sweep),
         output_dir=args.output_dir,
         output_stem=args.output_stem,
@@ -1889,10 +2028,19 @@ def main() -> None:
     )
     ensure_split_sizes(config, dataset_summary)
     environment = collect_environment(backend)
-    variants = build_variants(config.reflector_sweep, config.householder_init)
+    variants = build_variants(
+        config.reflector_sweep,
+        config.householder_init,
+        householder_mixing_sweep=config.householder_mixing_sweep,
+        householder_local_band_pairs=config.householder_local_band_pairs,
+    )
 
     LOGGER.info("Running %d variants on backend=%s", len(variants), backend)
     if backend == "flax":
+        if config.freeze_qk_after_warmup_steps is not None:
+            raise RuntimeError("freeze_qk_after_warmup_steps is only implemented for the torch backend.")
+        if any(variant.mixing_strategy != "global" for variant in variants):
+            raise RuntimeError("frequency_banded Householder transport is only implemented for the torch backend.")
         run_flax_variant, jax = build_flax_runtime()
         if jax.default_backend() not in {"gpu", "tpu"}:
             LOGGER.warning("Flax backend is running on %s, not TPU/GPU.", jax.default_backend())

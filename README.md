@@ -77,6 +77,14 @@ For a realistic-data single-device run outside Colab, use the reusable harness. 
 python scripts/run_real_data_scale_harness.py --train-steps 20 --reflector-sweep 0 8 --log-every 5 --diagnostics-every 10 --diagnostic-token-limit 96 --output-stem realistic_data_smoke
 ```
 
+To probe whether HH is being absorbed by `q_proj/k_proj`, run the symmetry-breaking ablation and a structured local transport instead of only the default global basis mixing:
+
+```bash
+python scripts/run_real_data_scale_harness.py --train-text-limit full --eval-text-limit full --eval-batches full --train-steps 600 --reflector-sweep 0 16 --householder-mixing-sweep global frequency_banded --householder-local-band-pairs 2 --freeze-qk-after-warmup-steps 200 --output-stem full_signal_qk_freeze_local
+```
+
+The new flags are `--householder-mixing-sweep`, `--householder-local-band-pairs`, and `--freeze-qk-after-warmup-steps`. The harness now records `qk_grad_global_norm`, `qk_frozen`, and the HH support fraction in the per-step histories so the freeze and locality behavior are visible in the resulting JSONL/CSV artifacts and training-dynamics plots.
+
 For a WSL GPU comparison run with `uv`, where Ubuntu already has working CUDA-enabled JAX and PyTorch in the system Python, use a shared-package `uv` environment and only overlay the minimal safe packages:
 
 ```bash
