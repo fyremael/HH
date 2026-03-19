@@ -34,6 +34,9 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "intervention" in intro
     assert "folded into `q_proj/k_proj`" in intro
     assert "fold-absorption deltas" in intro
+    assert "architecture_probe" in intro
+    assert "frequency_banded" in intro
+    assert "freezes `q_proj/k_proj` after warmup" in intro
 
     joined_sources = "\n".join(cell["source"] for cell in cells)
     assert 'run_command("git", "clone"' in joined_sources
@@ -45,6 +48,7 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "fast_sanity" in joined_sources
     assert "serious_comparison" in joined_sources
     assert "full_signal" in joined_sources
+    assert "architecture_probe" in joined_sources
     assert "geometry_signal" in joined_sources
     assert "capacity_limit" in joined_sources
     assert "capacity_max" in joined_sources
@@ -59,8 +63,16 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert '"num_layers": 16' in joined_sources
     assert '"embed_dim": 1536' in joined_sources
     assert '"num_heads": 24' in joined_sources
-    assert '"reflector_sweep": [0, 16, 32]' in joined_sources
+    assert '"reflector_sweep": [' in joined_sources
+    assert '            16,' in joined_sources
+    assert '            32' in joined_sources
     assert '"intervention_eval": True' in joined_sources
+    assert '"householder_mixing_sweep": [' in joined_sources
+    assert '"householder_local_band_pairs": 2' in joined_sources
+    assert '"freeze_qk_after_warmup_steps": None' in joined_sources
+    assert '"freeze_qk_after_warmup_steps": 200' in joined_sources
+    assert '"output_stem": "colab_a100_architecture_probe"' in joined_sources
+    assert '"frequency_banded"' in joined_sources
     assert "log_every" in joined_sources
     assert "diagnostics_every" in joined_sources
     assert "diagnostic_token_limit" in joined_sources
@@ -74,9 +86,13 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert '"--log-level"' in joined_sources
     assert '"INFO"' in joined_sources
     assert "append_optional_flag" in joined_sources
+    assert "append_literal_optional_flag" in joined_sources
     assert 'serialized = "full" if value is None else str(value)' in joined_sources
     assert '"--intervention-eval"' in joined_sources
     assert '"--no-intervention-eval"' in joined_sources
+    assert '"--householder-mixing-sweep"' in joined_sources
+    assert '"--householder-local-band-pairs"' in joined_sources
+    assert '"--freeze-qk-after-warmup-steps"' in joined_sources
     assert "Live harness logs will stream below." in joined_sources
     assert "subprocess.Popen(" in joined_sources
     assert "stdout=subprocess.PIPE" in joined_sources
@@ -101,8 +117,14 @@ def test_colab_scaling_harness_notebook_structure() -> None:
     assert "Evaluation mode:" in joined_sources
     assert "full validation" in joined_sources
     assert "Intervention eval:" in joined_sources
+    assert "Householder mixing sweep:" in joined_sources
+    assert "Local band pairs:" in joined_sources
+    assert "Freeze q/k after warmup:" in joined_sources
     assert "mean_tokens_per_second" in joined_sources
     assert "peak_memory_gb" in joined_sources
+    assert "mixing_strategy" in joined_sources
+    assert "local_band_pairs" in joined_sources
+    assert "freeze_qk_after_warmup_steps" in joined_sources
     assert "intervention_disable_hh_eval_delta" in joined_sources
     assert "folded_eval_delta" in joined_sources
     assert "folded_probe_logit_max_abs" in joined_sources
